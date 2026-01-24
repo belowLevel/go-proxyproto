@@ -26,12 +26,14 @@ const (
    };
 */
 type PP2SSL struct {
-	Client uint8 // The <client> field is made of a bit field from the following values,
+	// The Client field is made of a bit field from the following values,
 	// indicating which element is present: PP2_BITFIELD_CLIENT_SSL,
 	// PP2_BITFIELD_CLIENT_CERT_CONN, PP2_BITFIELD_CLIENT_CERT_SESS
-	Verify uint32 // Verify will be zero if the client presented a certificate
+	Client uint8
+	// Verify will be zero if the client presented a certificate
 	// and it was successfully verified, and non-zero otherwise.
-	TLV []proxyproto.TLV
+	Verify uint32
+	TLV    []proxyproto.TLV
 }
 
 // Verified is true if the client presented a certificate and it was successfully verified
@@ -102,6 +104,17 @@ func (s PP2SSL) ClientCN() (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// ClientCert returns the raw X.509 client certificate encoded in ASN.1 DER and
+// whether that extension exists.
+func (s PP2SSL) ClientCert() ([]byte, bool) {
+	for _, tlv := range s.TLV {
+		if tlv.Type == proxyproto.PP2_SUBTYPE_SSL_CLIENT_CERT {
+			return tlv.Value, true
+		}
+	}
+	return nil, false
 }
 
 // SSLType is true if the TLV is type SSL

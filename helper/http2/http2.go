@@ -2,6 +2,7 @@
 package http2
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -110,18 +111,27 @@ func (srv *Server) Serve(ln net.Listener) error {
 
 		delay = 0
 
-		go func() {
-			if err := srv.serveConn(conn); err != nil {
+		baseCtx := context.Background()
+		if srv.h1.BaseContext != nil {
+			baseCtx = srv.h1.BaseContext(ln)
+		}
+
+		go func(conn net.Conn, baseCtx context.Context) {
+			if err := srv.serveConn(conn, baseCtx); err != nil {
 				srv.errorLog().Printf("listener %q: %v", ln.Addr(), err)
 			}
-		}()
+		}(conn, baseCtx)
 	}
 }
 
-func (srv *Server) serveConn(conn net.Conn) error {
+func (srv *Server) serveConn(conn net.Conn, baseCtx context.Context) error {
 	var proto string
 	switch conn := conn.(type) {
 	case *tls.Conn:
+		if err := conn.Handshake(); err != nil {
+			conn.Close()
+			return err
+		}
 		proto = conn.ConnectionState().NegotiatedProtocol
 	case *proxyproto.Conn:
 		if proxyHeader := conn.ProxyHeader(); proxyHeader != nil {
@@ -143,7 +153,16 @@ func (srv *Server) serveConn(conn net.Conn) error {
 	switch proto {
 	case http2.NextProtoTLS, "h2c":
 		defer conn.Close()
-		opts := http2.ServeConnOpts{Handler: srv.h1.Handler}
+
+		ctx := baseCtx
+		// We don't check if srv.h1.ConnContext is nil so http.Server works the same
+		// with or without this middleware.
+		// For more info, see https://github.com/pires/go-proxyproto/pull/140/changes#r2725568706.
+		if connCtx := srv.h1.ConnContext(ctx, conn); connCtx != nil {
+			ctx = connCtx
+		}
+
+		opts := http2.ServeConnOpts{Context: ctx, BaseConfig: srv.h1}
 		srv.h2.ServeConn(conn, &opts)
 		return nil
 	case "", "http/1.0", "http/1.1":

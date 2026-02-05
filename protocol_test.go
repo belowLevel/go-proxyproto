@@ -13,13 +13,23 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// testSourceIPv4Addr is a source IPv4 address used in tests.
+const testSourceIPv4Addr string = "10.1.1.1"
+
+// testDestinationIPv4Addr is the destination IPv4 address used in tests.
+const testDestinationIPv4Addr string = "20.2.2.2"
+
+// testLocalhostRandomPort is a localhost random port used in tests.
+const testLocalhostRandomPort string = "127.0.0.1:0"
+
 func TestPassthrough(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -33,7 +43,11 @@ func TestPassthrough(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write([]byte("ping")); err != nil {
 			cliResult <- err
@@ -55,7 +69,11 @@ func TestPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	_, err = conn.Read(recv)
@@ -83,7 +101,7 @@ func TestRequiredWithReadHeaderTimeout(t *testing.T) {
 		t.Run(fmt.Sprint(duration), func(t *testing.T) {
 			start := time.Now()
 
-			l, err := net.Listen("tcp", "127.0.0.1:0")
+			l, err := net.Listen("tcp", testLocalhostRandomPort)
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -91,7 +109,7 @@ func TestRequiredWithReadHeaderTimeout(t *testing.T) {
 			pl := &Listener{
 				Listener:          l,
 				ReadHeaderTimeout: time.Millisecond * time.Duration(duration),
-				Policy: func(upstream net.Addr) (Policy, error) {
+				Policy: func(_ net.Addr) (Policy, error) {
 					return REQUIRE, nil
 				},
 			}
@@ -103,7 +121,11 @@ func TestRequiredWithReadHeaderTimeout(t *testing.T) {
 					cliResult <- err
 					return
 				}
-				defer conn.Close()
+				t.Cleanup(func() {
+					if closeErr := conn.Close(); closeErr != nil {
+						t.Errorf("failed to close connection: %v", closeErr)
+					}
+				})
 
 				close(cliResult)
 			}()
@@ -112,7 +134,11 @@ func TestRequiredWithReadHeaderTimeout(t *testing.T) {
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
-			defer conn.Close()
+			t.Cleanup(func() {
+				if closeErr := conn.Close(); closeErr != nil {
+					t.Errorf("failed to close connection: %v", closeErr)
+				}
+			})
 
 			// Read blocks forever if there is no ReadHeaderTimeout and the policy is not REQUIRE
 			recv := make([]byte, 4)
@@ -137,7 +163,7 @@ func TestUseWithReadHeaderTimeout(t *testing.T) {
 		t.Run(fmt.Sprint(duration), func(t *testing.T) {
 			start := time.Now()
 
-			l, err := net.Listen("tcp", "127.0.0.1:0")
+			l, err := net.Listen("tcp", testLocalhostRandomPort)
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -145,7 +171,7 @@ func TestUseWithReadHeaderTimeout(t *testing.T) {
 			pl := &Listener{
 				Listener:          l,
 				ReadHeaderTimeout: time.Millisecond * time.Duration(duration),
-				Policy: func(upstream net.Addr) (Policy, error) {
+				Policy: func(_ net.Addr) (Policy, error) {
 					return USE, nil
 				},
 			}
@@ -157,7 +183,11 @@ func TestUseWithReadHeaderTimeout(t *testing.T) {
 					cliResult <- err
 					return
 				}
-				defer conn.Close()
+				t.Cleanup(func() {
+					if closeErr := conn.Close(); closeErr != nil {
+						t.Errorf("failed to close connection: %v", closeErr)
+					}
+				})
 
 				close(cliResult)
 			}()
@@ -166,7 +196,11 @@ func TestUseWithReadHeaderTimeout(t *testing.T) {
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
-			defer conn.Close()
+			t.Cleanup(func() {
+				if closeErr := conn.Close(); closeErr != nil {
+					t.Errorf("failed to close connection: %v", closeErr)
+				}
+			})
 
 			// 2 times the ReadHeaderTimeout because the first timeout
 			// should occur (the one set on the listener) and allow for the second to follow up
@@ -189,10 +223,162 @@ func TestUseWithReadHeaderTimeout(t *testing.T) {
 	}
 }
 
+func TestNewConnSetReadHeaderTimeoutOption(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+	t.Cleanup(func() {
+		if closeErr := peer.Close(); closeErr != nil {
+			t.Errorf("failed to close peer connection: %v", closeErr)
+		}
+	})
+
+	// Ensure SetReadHeaderTimeout sets the connection-specific timeout.
+	timeout := 150 * time.Millisecond
+	proxyConn := NewConn(conn, SetReadHeaderTimeout(timeout))
+	if proxyConn.readHeaderTimeout != timeout {
+		t.Fatalf("expected readHeaderTimeout %v, got %v", timeout, proxyConn.readHeaderTimeout)
+	}
+}
+
+func TestNewConnSetReadHeaderTimeoutIgnoresNegative(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+	t.Cleanup(func() {
+		if closeErr := peer.Close(); closeErr != nil {
+			t.Errorf("failed to close peer connection: %v", closeErr)
+		}
+	})
+
+	// Negative values should be ignored, leaving the timeout unset.
+	proxyConn := NewConn(conn, SetReadHeaderTimeout(-1))
+	if proxyConn.readHeaderTimeout != 0 {
+		t.Fatalf("expected readHeaderTimeout to remain 0, got %v", proxyConn.readHeaderTimeout)
+	}
+}
+
+func TestReadHeaderTimeoutRespectsEarlierDeadline(t *testing.T) {
+	const (
+		headerTimeout = 200 * time.Millisecond
+		userTimeout   = 60 * time.Millisecond
+		tolerance     = 100 * time.Millisecond
+	)
+
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	pl := &Listener{
+		Listener:          l,
+		ReadHeaderTimeout: headerTimeout,
+		Policy: func(_ net.Addr) (Policy, error) {
+			// Use REQUIRE so a timeout is surfaced as ErrNoProxyProtocol.
+			return REQUIRE, nil
+		},
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+
+	dialResultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := net.Dial("tcp", pl.Addr().String())
+		dialResultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	result := <-dialResultCh
+	if result.err != nil {
+		t.Fatalf("client error: %v", result.err)
+	}
+	t.Cleanup(func() {
+		if closeErr := result.conn.Close(); closeErr != nil {
+			t.Errorf("failed to close client connection: %v", closeErr)
+		}
+	})
+
+	// Set a shorter user deadline than the readHeaderTimeout and do not send data.
+	if err := conn.SetReadDeadline(time.Now().Add(userTimeout)); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	start := time.Now()
+	recv := make([]byte, 1)
+	_, err = conn.Read(recv)
+	elapsed := time.Since(start)
+
+	// The read should honor the earlier user deadline instead of waiting
+	// for the longer readHeaderTimeout.
+	if !errors.Is(err, ErrNoProxyProtocol) {
+		t.Fatalf("expected ErrNoProxyProtocol, got: %v", err)
+	}
+	if elapsed > userTimeout+tolerance {
+		t.Fatalf("read exceeded user deadline: elapsed=%v timeout=%v", elapsed, userTimeout)
+	}
+}
+
+func TestDeadlineSettersAfterHeaderProcessed(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+	t.Cleanup(func() {
+		if closeErr := peer.Close(); closeErr != nil {
+			t.Errorf("failed to close peer connection: %v", closeErr)
+		}
+	})
+
+	proxyConn := NewConn(conn)
+
+	// Ensure header processing completes by sending a non-PROXY byte
+	// and reading it through the proxy connection.
+	go func() {
+		if _, err := peer.Write([]byte("x")); err != nil {
+			t.Errorf("failed to write peer data: %v", err)
+		}
+	}()
+	buf := make([]byte, 1)
+	if _, err := proxyConn.Read(buf); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	if err := proxyConn.SetDeadline(deadline); err != nil {
+		t.Fatalf("unexpected SetDeadline error: %v", err)
+	}
+	if err := proxyConn.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("unexpected SetReadDeadline error: %v", err)
+	}
+	if err := proxyConn.SetWriteDeadline(deadline); err != nil {
+		t.Fatalf("unexpected SetWriteDeadline error: %v", err)
+	}
+}
+
 func TestReadHeaderTimeoutIsReset(t *testing.T) {
 	const timeout = time.Millisecond * 250
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -207,11 +393,11 @@ func TestReadHeaderTimeoutIsReset(t *testing.T) {
 		Command:           PROXY,
 		TransportProtocol: TCPv4,
 		SourceAddr: &net.TCPAddr{
-			IP:   net.ParseIP("10.1.1.1"),
+			IP:   net.ParseIP(testSourceIPv4Addr),
 			Port: 1000,
 		},
 		DestinationAddr: &net.TCPAddr{
-			IP:   net.ParseIP("20.2.2.2"),
+			IP:   net.ParseIP(testDestinationIPv4Addr),
 			Port: 2000,
 		},
 	}
@@ -223,7 +409,11 @@ func TestReadHeaderTimeoutIsReset(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		if _, err := header.WriteTo(conn); err != nil {
@@ -254,7 +444,11 @@ func TestReadHeaderTimeoutIsReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	// Set our deadlines higher than our ReadHeaderTimeout
 	if err := conn.SetReadDeadline(time.Now().Add(timeout * 3)); err != nil {
@@ -278,7 +472,7 @@ func TestReadHeaderTimeoutIsReset(t *testing.T) {
 
 	// Check the remote addr
 	addr := conn.RemoteAddr().(*net.TCPAddr)
-	if addr.IP.String() != "10.1.1.1" {
+	if addr.IP.String() != testSourceIPv4Addr {
 		t.Fatalf("bad: %v", addr)
 	}
 	if addr.Port != 1000 {
@@ -302,7 +496,7 @@ func TestReadHeaderTimeoutIsReset(t *testing.T) {
 func TestReadHeaderTimeoutIsEmpty(t *testing.T) {
 	DefaultReadHeaderTimeout = 200 * time.Millisecond
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -316,11 +510,11 @@ func TestReadHeaderTimeoutIsEmpty(t *testing.T) {
 		Command:           PROXY,
 		TransportProtocol: TCPv4,
 		SourceAddr: &net.TCPAddr{
-			IP:   net.ParseIP("10.1.1.1"),
+			IP:   net.ParseIP(testSourceIPv4Addr),
 			Port: 1000,
 		},
 		DestinationAddr: &net.TCPAddr{
-			IP:   net.ParseIP("20.2.2.2"),
+			IP:   net.ParseIP(testDestinationIPv4Addr),
 			Port: 2000,
 		},
 	}
@@ -332,7 +526,11 @@ func TestReadHeaderTimeoutIsEmpty(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Sleep here longer than the configured timeout.
 		time.Sleep(250 * time.Millisecond)
@@ -355,7 +553,11 @@ func TestReadHeaderTimeoutIsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != nil {
@@ -364,7 +566,7 @@ func TestReadHeaderTimeoutIsEmpty(t *testing.T) {
 
 	// Check the remote addr
 	addr := conn.RemoteAddr().(*net.TCPAddr)
-	if addr.IP.String() == "10.1.1.1" {
+	if addr.IP.String() == testSourceIPv4Addr {
 		t.Fatalf("bad: %v", addr)
 	}
 	if addr.Port == 1000 {
@@ -380,7 +582,7 @@ func TestReadHeaderTimeoutIsEmpty(t *testing.T) {
 // with a negative timeout. Therefore, we expect the right ProxyHeader
 // to be returned.
 func TestReadHeaderTimeoutIsNegative(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -395,11 +597,11 @@ func TestReadHeaderTimeoutIsNegative(t *testing.T) {
 		Command:           PROXY,
 		TransportProtocol: TCPv4,
 		SourceAddr: &net.TCPAddr{
-			IP:   net.ParseIP("10.1.1.1"),
+			IP:   net.ParseIP(testSourceIPv4Addr),
 			Port: 1000,
 		},
 		DestinationAddr: &net.TCPAddr{
-			IP:   net.ParseIP("20.2.2.2"),
+			IP:   net.ParseIP(testDestinationIPv4Addr),
 			Port: 2000,
 		},
 	}
@@ -411,7 +613,11 @@ func TestReadHeaderTimeoutIsNegative(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Sleep here longer than the configured timeout.
 		time.Sleep(250 * time.Millisecond)
@@ -434,7 +640,11 @@ func TestReadHeaderTimeoutIsNegative(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != nil {
@@ -443,7 +653,7 @@ func TestReadHeaderTimeoutIsNegative(t *testing.T) {
 
 	// Check the remote addr
 	addr := conn.RemoteAddr().(*net.TCPAddr)
-	if addr.IP.String() != "10.1.1.1" {
+	if addr.IP.String() != testSourceIPv4Addr {
 		t.Fatalf("bad: %v", addr)
 	}
 	if addr.Port != 1000 {
@@ -456,7 +666,7 @@ func TestReadHeaderTimeoutIsNegative(t *testing.T) {
 }
 
 func TestParse_ipv4(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -468,11 +678,11 @@ func TestParse_ipv4(t *testing.T) {
 		Command:           PROXY,
 		TransportProtocol: TCPv4,
 		SourceAddr: &net.TCPAddr{
-			IP:   net.ParseIP("10.1.1.1"),
+			IP:   net.ParseIP(testSourceIPv4Addr),
 			Port: 1000,
 		},
 		DestinationAddr: &net.TCPAddr{
-			IP:   net.ParseIP("20.2.2.2"),
+			IP:   net.ParseIP(testDestinationIPv4Addr),
 			Port: 2000,
 		},
 	}
@@ -484,7 +694,11 @@ func TestParse_ipv4(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		if _, err := header.WriteTo(conn); err != nil {
@@ -513,7 +727,11 @@ func TestParse_ipv4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != nil {
@@ -529,7 +747,7 @@ func TestParse_ipv4(t *testing.T) {
 
 	// Check the remote addr
 	addr := conn.RemoteAddr().(*net.TCPAddr)
-	if addr.IP.String() != "10.1.1.1" {
+	if addr.IP.String() != testSourceIPv4Addr {
 		t.Fatalf("bad: %v", addr)
 	}
 	if addr.Port != 1000 {
@@ -543,6 +761,177 @@ func TestParse_ipv4(t *testing.T) {
 	err = <-cliResult
 	if err != nil {
 		t.Fatalf("client error: %v", err)
+	}
+}
+
+func TestParse_unixStream(t *testing.T) {
+	socketDir := t.TempDir()
+	socketPath := filepath.Join(socketDir, "proxy.sock")
+	l, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := l.Close(); closeErr != nil {
+			t.Errorf("failed to close listener: %v", closeErr)
+		}
+	})
+
+	pl := &Listener{Listener: l}
+
+	header := &Header{
+		Version:           2,
+		Command:           PROXY,
+		TransportProtocol: UnixStream,
+		SourceAddr: &net.UnixAddr{
+			Net:  "unix",
+			Name: "source.sock",
+		},
+		DestinationAddr: &net.UnixAddr{
+			Net:  "unix",
+			Name: "dest.sock",
+		},
+	}
+
+	cliResult := make(chan error)
+	go func() {
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			cliResult <- err
+			return
+		}
+		defer func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		}()
+
+		// Write out the header!
+		if _, err := header.WriteTo(conn); err != nil {
+			cliResult <- err
+			return
+		}
+
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			cliResult <- err
+			return
+		}
+
+		recv := make([]byte, 4)
+		if _, err = conn.Read(recv); err != nil {
+			cliResult <- err
+			return
+		}
+		if !bytes.Equal(recv, []byte("pong")) {
+			cliResult <- fmt.Errorf("bad: %v", recv)
+			return
+		}
+
+		close(cliResult)
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	recv := make([]byte, 4)
+	if _, err = conn.Read(recv); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !bytes.Equal(recv, []byte("ping")) {
+		t.Fatalf("bad: %v", recv)
+	}
+
+	if _, err := conn.Write([]byte("pong")); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	addr := conn.RemoteAddr().(*net.UnixAddr)
+	if addr.Name != header.SourceAddr.(*net.UnixAddr).Name {
+		t.Fatalf("bad: %v", addr)
+	}
+
+	h := conn.(*Conn).ProxyHeader()
+	if !h.EqualsTo(header) {
+		t.Errorf("bad: %v", h)
+	}
+
+	err = <-cliResult
+	if err != nil {
+		t.Fatalf("client error: %v", err)
+	}
+}
+
+func TestParse_unixDatagram(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := client.Close(); closeErr != nil {
+			t.Errorf("failed to close client: %v", closeErr)
+		}
+	})
+	t.Cleanup(func() {
+		if closeErr := server.Close(); closeErr != nil {
+			t.Errorf("failed to close server: %v", closeErr)
+		}
+	})
+
+	header := &Header{
+		Version:           2,
+		Command:           PROXY,
+		TransportProtocol: UnixDatagram,
+		SourceAddr: &net.UnixAddr{
+			Net:  "unixgram",
+			Name: "source.sock",
+		},
+		DestinationAddr: &net.UnixAddr{
+			Net:  "unixgram",
+			Name: "dest.sock",
+		},
+	}
+
+	go func() {
+		defer func() {
+			if closeErr := client.Close(); closeErr != nil {
+				t.Errorf("failed to close client: %v", closeErr)
+			}
+		}()
+		if _, err := header.WriteTo(client); err != nil {
+			t.Errorf("failed to write header: %v", err)
+		}
+		if _, err := client.Write([]byte("ping")); err != nil {
+			t.Errorf("failed to write ping: %v", err)
+		}
+	}()
+
+	conn := NewConn(server)
+	recv := make([]byte, 4)
+	if _, err := conn.Read(recv); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if !bytes.Equal(recv, []byte("ping")) {
+		t.Fatalf("bad: %v", recv)
+	}
+
+	remoteAddr := conn.RemoteAddr().(*net.UnixAddr)
+	if remoteAddr.Name != header.SourceAddr.(*net.UnixAddr).Name {
+		t.Fatalf("bad: %v", remoteAddr)
+	}
+
+	localAddr := conn.LocalAddr().(*net.UnixAddr)
+	if localAddr.Name != header.DestinationAddr.(*net.UnixAddr).Name {
+		t.Fatalf("bad: %v", localAddr)
+	}
+
+	h := conn.ProxyHeader()
+	if !h.EqualsTo(header) {
+		t.Errorf("bad: %v", h)
 	}
 }
 
@@ -575,7 +964,11 @@ func TestParse_ipv6(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		if _, err := header.WriteTo(conn); err != nil {
@@ -604,7 +997,11 @@ func TestParse_ipv6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != nil {
@@ -644,7 +1041,7 @@ func TestAcceptReturnsErrorWhenPolicyFuncErrors(t *testing.T) {
 	}
 
 	expectedErr := fmt.Errorf("failure")
-	policyFunc := func(upstream net.Addr) (Policy, error) { return USE, expectedErr }
+	policyFunc := func(_ net.Addr) (Policy, error) { return USE, expectedErr }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -655,8 +1052,11 @@ func TestAcceptReturnsErrorWhenPolicyFuncErrors(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
-
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 		close(cliResult)
 	}()
 
@@ -675,13 +1075,13 @@ func TestAcceptReturnsErrorWhenPolicyFuncErrors(t *testing.T) {
 }
 
 func TestPanicIfPolicyAndConnPolicySet(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	connPolicyFunc := func(connopts ConnPolicyOptions) (Policy, error) { return USE, nil }
-	policyFunc := func(upstream net.Addr) (Policy, error) { return USE, nil }
+	connPolicyFunc := func(_ ConnPolicyOptions) (Policy, error) { return USE, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return USE, nil }
 
 	pl := &Listener{Listener: l, ConnPolicy: connPolicyFunc, Policy: policyFunc}
 
@@ -692,11 +1092,14 @@ func TestPanicIfPolicyAndConnPolicySet(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		close(cliResult)
 	}()
-
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("accept did panic as expected with error, %v", r)
@@ -720,7 +1123,7 @@ func TestAcceptReturnsErrorWhenConnPolicyFuncErrors(t *testing.T) {
 	}
 
 	expectedErr := fmt.Errorf("failure")
-	connPolicyFunc := func(connopts ConnPolicyOptions) (Policy, error) { return USE, expectedErr }
+	connPolicyFunc := func(_ ConnPolicyOptions) (Policy, error) { return USE, expectedErr }
 
 	pl := &Listener{Listener: l, ConnPolicy: connPolicyFunc}
 
@@ -731,7 +1134,11 @@ func TestAcceptReturnsErrorWhenConnPolicyFuncErrors(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		close(cliResult)
 	}()
@@ -751,12 +1158,12 @@ func TestAcceptReturnsErrorWhenConnPolicyFuncErrors(t *testing.T) {
 }
 
 func TestReadingIsRefusedWhenProxyHeaderRequiredButMissing(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return REQUIRE, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return REQUIRE, nil }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -767,7 +1174,11 @@ func TestReadingIsRefusedWhenProxyHeaderRequiredButMissing(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write([]byte("ping")); err != nil {
 			cliResult <- err
@@ -781,7 +1192,11 @@ func TestReadingIsRefusedWhenProxyHeaderRequiredButMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != ErrNoProxyProtocol {
@@ -794,12 +1209,12 @@ func TestReadingIsRefusedWhenProxyHeaderRequiredButMissing(t *testing.T) {
 }
 
 func TestReadingIsRefusedWhenProxyHeaderPresentButNotAllowed(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return REJECT, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return REJECT, nil }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -810,17 +1225,21 @@ func TestReadingIsRefusedWhenProxyHeaderPresentButNotAllowed(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 		header := &Header{
 			Version:           2,
 			Command:           PROXY,
 			TransportProtocol: TCPv4,
 			SourceAddr: &net.TCPAddr{
-				IP:   net.ParseIP("10.1.1.1"),
+				IP:   net.ParseIP(testSourceIPv4Addr),
 				Port: 1000,
 			},
 			DestinationAddr: &net.TCPAddr{
-				IP:   net.ParseIP("20.2.2.2"),
+				IP:   net.ParseIP(testDestinationIPv4Addr),
 				Port: 2000,
 			},
 		}
@@ -836,7 +1255,11 @@ func TestReadingIsRefusedWhenProxyHeaderPresentButNotAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != ErrSuperfluousProxyHeader {
@@ -849,12 +1272,12 @@ func TestReadingIsRefusedWhenProxyHeaderPresentButNotAllowed(t *testing.T) {
 }
 
 func TestIgnorePolicyIgnoresIpFromProxyHeader(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return IGNORE, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return IGNORE, nil }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -865,7 +1288,11 @@ func TestIgnorePolicyIgnoresIpFromProxyHeader(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		header := &Header{
@@ -873,11 +1300,11 @@ func TestIgnorePolicyIgnoresIpFromProxyHeader(t *testing.T) {
 			Command:           PROXY,
 			TransportProtocol: TCPv4,
 			SourceAddr: &net.TCPAddr{
-				IP:   net.ParseIP("10.1.1.1"),
+				IP:   net.ParseIP(testSourceIPv4Addr),
 				Port: 1000,
 			},
 			DestinationAddr: &net.TCPAddr{
-				IP:   net.ParseIP("20.2.2.2"),
+				IP:   net.ParseIP(testDestinationIPv4Addr),
 				Port: 2000,
 			},
 		}
@@ -908,7 +1335,11 @@ func TestIgnorePolicyIgnoresIpFromProxyHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != nil {
@@ -935,19 +1366,21 @@ func TestIgnorePolicyIgnoresIpFromProxyHeader(t *testing.T) {
 
 func Test_AllOptionsAreRecognized(t *testing.T) {
 	recognizedOpt1 := false
-	opt1 := func(c *Conn) {
+	opt1 := func(_ *Conn) {
 		recognizedOpt1 = true
 	}
 
 	recognizedOpt2 := false
-	opt2 := func(c *Conn) {
+	opt2 := func(_ *Conn) {
 		recognizedOpt2 = true
 	}
 
 	server, client := net.Pipe()
-	defer func() {
-		client.Close()
-	}()
+	t.Cleanup(func() {
+		if closeErr := client.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	c := NewConn(server, opt1, opt2)
 	if !recognizedOpt1 {
@@ -958,16 +1391,20 @@ func Test_AllOptionsAreRecognized(t *testing.T) {
 		t.Error("Expected option 2 recognized")
 	}
 
-	c.Close()
+	t.Cleanup(func() {
+		if closeErr := c.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 }
 
 func TestReadingIsRefusedOnErrorWhenRemoteAddrRequestedFirst(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return REQUIRE, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return REQUIRE, nil }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -978,7 +1415,11 @@ func TestReadingIsRefusedOnErrorWhenRemoteAddrRequestedFirst(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write([]byte("ping")); err != nil {
 			cliResult <- err
@@ -992,7 +1433,11 @@ func TestReadingIsRefusedOnErrorWhenRemoteAddrRequestedFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	_ = conn.RemoteAddr()
 	recv := make([]byte, 4)
@@ -1006,12 +1451,12 @@ func TestReadingIsRefusedOnErrorWhenRemoteAddrRequestedFirst(t *testing.T) {
 }
 
 func TestReadingIsRefusedOnErrorWhenLocalAddrRequestedFirst(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return REQUIRE, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return REQUIRE, nil }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -1022,7 +1467,11 @@ func TestReadingIsRefusedOnErrorWhenLocalAddrRequestedFirst(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write([]byte("ping")); err != nil {
 			cliResult <- err
@@ -1036,7 +1485,11 @@ func TestReadingIsRefusedOnErrorWhenLocalAddrRequestedFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	_ = conn.LocalAddr()
 	recv := make([]byte, 4)
@@ -1050,12 +1503,12 @@ func TestReadingIsRefusedOnErrorWhenLocalAddrRequestedFirst(t *testing.T) {
 }
 
 func TestSkipProxyProtocolPolicy(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	connPolicyFunc := func(connopts ConnPolicyOptions) (Policy, error) { return SKIP, nil }
+	connPolicyFunc := func(_ ConnPolicyOptions) (Policy, error) { return SKIP, nil }
 
 	pl := &Listener{
 		Listener:   l,
@@ -1070,7 +1523,11 @@ func TestSkipProxyProtocolPolicy(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write(ping); err != nil {
 			cliResult <- err
@@ -1084,7 +1541,11 @@ func TestSkipProxyProtocolPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	_, ok := conn.(*net.TCPConn)
 	if !ok {
@@ -1107,12 +1568,12 @@ func TestSkipProxyProtocolPolicy(t *testing.T) {
 }
 
 func TestSkipProxyProtocolConnPolicy(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return SKIP, nil }
+	policyFunc := func(_ net.Addr) (Policy, error) { return SKIP, nil }
 
 	pl := &Listener{
 		Listener: l,
@@ -1127,7 +1588,11 @@ func TestSkipProxyProtocolConnPolicy(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write(ping); err != nil {
 			cliResult <- err
@@ -1141,7 +1606,11 @@ func TestSkipProxyProtocolConnPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	_, ok := conn.(*net.TCPConn)
 	if !ok {
@@ -1163,13 +1632,79 @@ func TestSkipProxyProtocolConnPolicy(t *testing.T) {
 	}
 }
 
-func Test_ConnectionCasts(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+func TestLocalCommandUsesUnderlyingAddrs(t *testing.T) {
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	policyFunc := func(upstream net.Addr) (Policy, error) { return REQUIRE, nil }
+	pl := &Listener{Listener: l}
+
+	header := &Header{
+		Version:           2,
+		Command:           LOCAL,
+		TransportProtocol: UNSPEC,
+	}
+
+	cliResult := make(chan error)
+	go func() {
+		conn, err := net.Dial("tcp", pl.Addr().String())
+		if err != nil {
+			cliResult <- err
+			return
+		}
+
+		// Write a LOCAL header with no address information.
+		if _, err := header.WriteTo(conn); err != nil {
+			cliResult <- err
+			return
+		}
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			cliResult <- err
+			return
+		}
+
+		// Close client side to avoid leaving the connection open.
+		if err := conn.Close(); err != nil {
+			cliResult <- err
+			return
+		}
+
+		close(cliResult)
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	proxyConn := conn.(*Conn)
+	// LOCAL should make LocalAddr/RemoteAddr fall back to underlying addresses.
+	if proxyConn.LocalAddr().String() != proxyConn.Raw().LocalAddr().String() {
+		t.Fatalf("LocalAddr should use underlying address for LOCAL command")
+	}
+	if proxyConn.RemoteAddr().String() != proxyConn.Raw().RemoteAddr().String() {
+		t.Fatalf("RemoteAddr should use underlying address for LOCAL command")
+	}
+
+	err = <-cliResult
+	if err != nil {
+		t.Fatalf("client error: %v", err)
+	}
+}
+
+func Test_ConnectionCasts(t *testing.T) {
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	policyFunc := func(_ net.Addr) (Policy, error) { return REQUIRE, nil }
 
 	pl := &Listener{Listener: l, Policy: policyFunc}
 
@@ -1180,7 +1715,11 @@ func Test_ConnectionCasts(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		if _, err := conn.Write([]byte("ping")); err != nil {
 			cliResult <- err
@@ -1194,7 +1733,11 @@ func Test_ConnectionCasts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	proxyprotoConn := conn.(*Conn)
 	_, ok := proxyprotoConn.TCPConn()
@@ -1235,7 +1778,11 @@ func Test_ConnectionErrorsWhenHeaderValidationFails(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		header := &Header{
@@ -1243,11 +1790,11 @@ func Test_ConnectionErrorsWhenHeaderValidationFails(t *testing.T) {
 			Command:           PROXY,
 			TransportProtocol: TCPv4,
 			SourceAddr: &net.TCPAddr{
-				IP:   net.ParseIP("10.1.1.1"),
+				IP:   net.ParseIP(testSourceIPv4Addr),
 				Port: 1000,
 			},
 			DestinationAddr: &net.TCPAddr{
-				IP:   net.ParseIP("20.2.2.2"),
+				IP:   net.ParseIP(testDestinationIPv4Addr),
 				Port: 2000,
 			},
 		}
@@ -1263,7 +1810,11 @@ func Test_ConnectionErrorsWhenHeaderValidationFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 4)
 	if _, err = conn.Read(recv); err != validationError {
@@ -1301,15 +1852,39 @@ func Test_ConnectionHandlesInvalidUpstreamError(t *testing.T) {
 	// Kick off the listener and return any error via the chanel.
 	errCh := make(chan error)
 	defer close(errCh)
-	go func(t *testing.T) {
+	go func() {
 		_, err := newLn.Accept()
 		errCh <- err
-	}(t)
+	}()
+
+	client := http.Client{Timeout: 200 * time.Millisecond}
 
 	// Make two calls to trigger the listener's accept, the first should experience
 	// the ErrInvalidUpstream and keep the listener open, the second should experience
 	// a different error which will cause the listener to close.
-	_, _ = http.Get("http://localhost:8080")
+
+	// First call should experience the ErrInvalidUpstream and keep the listener open.
+	resp, err := client.Get("http://localhost:8080")
+	if resp != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Fatalf("failed to close response body: %v", closeErr)
+		}
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Logf("first request failed as expected: %v", err)
+	}
+
+	// Ensure the ConnPolicy function was called at least once.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if connectionCounter.Load() >= 1 {
+			break
+		}
+	}
+	if connectionCounter.Load() < 1 {
+		t.Fatalf("expected ConnPolicy to be called at least once")
+	}
+
 	// Wait a few seconds to ensure we didn't get anything back on our channel.
 	select {
 	case err := <-errCh:
@@ -1320,15 +1895,21 @@ func Test_ConnectionHandlesInvalidUpstreamError(t *testing.T) {
 		// No error returned (as expected, we're still listening though)
 	}
 
-	_, _ = http.Get("http://localhost:8080")
-	// Wait a few seconds before we fail the test as we should have received an
-	// error that was not invalid upstream.
+	// Second call should experience a different error and cause the listener to close.
+	resp, err = client.Get("http://localhost:8080")
+	if resp != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Fatalf("failed to close response body: %v", closeErr)
+		}
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Logf("second request failed as expected: %v", err)
+	}
+
+	// Ensure the listener is closed.
 	select {
 	case err := <-errCh:
-		if err == nil {
-			t.Fatalf("errors other than invalid upstream should error")
-		}
-		if !errors.Is(ErrNoProxyProtocol, err) {
+		if err != nil && !errors.Is(err, ErrNoProxyProtocol) {
 			t.Fatalf("unexpected error type: %v", err)
 		}
 	case <-time.After(2 * time.Second):
@@ -1353,11 +1934,11 @@ func (s *TestTLSServer) Addr() string {
 	return s.Listener.Addr().String()
 }
 
-func (s *TestTLSServer) Close() {
-	s.Listener.Close()
+func (s *TestTLSServer) Close() error {
+	return s.Listener.Close()
 }
 
-// based on net/http/httptest/Server.StartTLS
+// based on net/http/httptest/Server.StartTLS.
 func NewTestTLSServer(l net.Listener) *TestTLSServer {
 	s := &TestTLSServer{}
 
@@ -1376,7 +1957,8 @@ func NewTestTLSServer(l net.Listener) *TestTLSServer {
 	certpool := x509.NewCertPool()
 	certpool.AddCert(s.certificate)
 	s.TLSClientConfig = &tls.Config{
-		RootCAs: certpool,
+		RootCAs:    certpool,
+		MinVersion: tls.VersionTLS12,
 	}
 	s.Listener = tls.NewListener(l, s.TLS)
 
@@ -1384,7 +1966,7 @@ func NewTestTLSServer(l net.Listener) *TestTLSServer {
 }
 
 func Test_TLSServer(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1392,11 +1974,15 @@ func Test_TLSServer(t *testing.T) {
 	s := NewTestTLSServer(l)
 	s.Listener = &Listener{
 		Listener: s.Listener,
-		Policy: func(upstream net.Addr) (Policy, error) {
+		Policy: func(_ net.Addr) (Policy, error) {
 			return REQUIRE, nil
 		},
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close TLS server: %v", err)
+		}
+	}()
 
 	cliResult := make(chan error)
 	go func() {
@@ -1405,7 +1991,11 @@ func Test_TLSServer(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		header := &Header{
@@ -1413,11 +2003,11 @@ func Test_TLSServer(t *testing.T) {
 			Command:           PROXY,
 			TransportProtocol: TCPv4,
 			SourceAddr: &net.TCPAddr{
-				IP:   net.ParseIP("10.1.1.1"),
+				IP:   net.ParseIP(testSourceIPv4Addr),
 				Port: 1000,
 			},
 			DestinationAddr: &net.TCPAddr{
-				IP:   net.ParseIP("20.2.2.2"),
+				IP:   net.ParseIP(testDestinationIPv4Addr),
 				Port: 2000,
 			},
 		}
@@ -1438,7 +2028,11 @@ func Test_TLSServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 1024)
 	n, err := conn.Read(recv)
@@ -1455,7 +2049,7 @@ func Test_TLSServer(t *testing.T) {
 }
 
 func Test_MisconfiguredTLSServerRespondsWithUnderlyingError(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -1463,11 +2057,15 @@ func Test_MisconfiguredTLSServerRespondsWithUnderlyingError(t *testing.T) {
 	s := NewTestTLSServer(l)
 	s.Listener = &Listener{
 		Listener: s.Listener,
-		Policy: func(upstream net.Addr) (Policy, error) {
+		Policy: func(_ net.Addr) (Policy, error) {
 			return REQUIRE, nil
 		},
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close TLS server: %v", err)
+		}
+	}()
 
 	cliResult := make(chan error)
 	go func() {
@@ -1488,7 +2086,11 @@ func Test_MisconfiguredTLSServerRespondsWithUnderlyingError(t *testing.T) {
 			cliResult <- err
 			return
 		}
-		defer conn.Close()
+		t.Cleanup(func() {
+			if closeErr := conn.Close(); closeErr != nil {
+				t.Errorf("failed to close connection: %v", closeErr)
+			}
+		})
 
 		// Write out the header!
 		header := &Header{
@@ -1496,11 +2098,11 @@ func Test_MisconfiguredTLSServerRespondsWithUnderlyingError(t *testing.T) {
 			Command:           PROXY,
 			TransportProtocol: TCPv4,
 			SourceAddr: &net.TCPAddr{
-				IP:   net.ParseIP("10.1.1.1"),
+				IP:   net.ParseIP(testSourceIPv4Addr),
 				Port: 1000,
 			},
 			DestinationAddr: &net.TCPAddr{
-				IP:   net.ParseIP("20.2.2.2"),
+				IP:   net.ParseIP(testDestinationIPv4Addr),
 				Port: 2000,
 			},
 		}
@@ -1521,7 +2123,11 @@ func Test_MisconfiguredTLSServerRespondsWithUnderlyingError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
 
 	recv := make([]byte, 1024)
 	if _, err = conn.Read(recv); err.Error() != "tls: first record does not look like a TLS handshake" {
@@ -1539,6 +2145,54 @@ type testConn struct {
 	net.Conn           // nil; crash on any unexpected use
 }
 
+type deadlineConn struct {
+	deadline      time.Time
+	readDeadline  time.Time
+	writeDeadline time.Time
+}
+
+func (c *deadlineConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (c *deadlineConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *deadlineConn) Close() error                { return nil }
+func (c *deadlineConn) LocalAddr() net.Addr         { return dummyAddr("local") }
+func (c *deadlineConn) RemoteAddr() net.Addr        { return dummyAddr("remote") }
+func (c *deadlineConn) SetDeadline(t time.Time) error {
+	c.deadline = t
+	return nil
+}
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline = t
+	return nil
+}
+func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline = t
+	return nil
+}
+
+type noReadFromConn struct {
+	written bytes.Buffer
+}
+
+func (c *noReadFromConn) Read(_ []byte) (int, error) { return 0, io.EOF }
+func (c *noReadFromConn) Write(p []byte) (int, error) {
+	return c.written.Write(p)
+}
+func (c *noReadFromConn) Close() error                { return nil }
+func (c *noReadFromConn) LocalAddr() net.Addr         { return dummyAddr("local") }
+func (c *noReadFromConn) RemoteAddr() net.Addr        { return dummyAddr("remote") }
+func (c *noReadFromConn) SetDeadline(time.Time) error { return nil }
+func (c *noReadFromConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *noReadFromConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string { return "dummy" }
+func (a dummyAddr) String() string  { return string(a) }
+
 func (c *testConn) ReadFrom(r io.Reader) (int64, error) {
 	c.readFromCalledWith = r
 	b, err := io.ReadAll(r)
@@ -1549,7 +2203,7 @@ func (c *testConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *testConn) Read(p []byte) (int, error) {
+func (c *testConn) Read(_ []byte) (int, error) {
 	if c.reads == 0 {
 		return 0, io.EOF
 	}
@@ -1596,13 +2250,138 @@ func TestCopyFromWrappedConnectionToWrappedConnection(t *testing.T) {
 	}
 }
 
+func TestDeadlineWrappersDelegate(t *testing.T) {
+	conn := &deadlineConn{}
+	proxyConn := NewConn(conn)
+
+	deadline := time.Now().Add(2 * time.Second)
+	readDeadline := time.Now().Add(3 * time.Second)
+	writeDeadline := time.Now().Add(4 * time.Second)
+
+	// Ensure deadline setters pass through to the underlying connection.
+	if err := proxyConn.SetDeadline(deadline); err != nil {
+		t.Fatalf("unexpected SetDeadline error: %v", err)
+	}
+	if err := proxyConn.SetReadDeadline(readDeadline); err != nil {
+		t.Fatalf("unexpected SetReadDeadline error: %v", err)
+	}
+	if err := proxyConn.SetWriteDeadline(writeDeadline); err != nil {
+		t.Fatalf("unexpected SetWriteDeadline error: %v", err)
+	}
+
+	if !conn.deadline.Equal(deadline) {
+		t.Fatalf("SetDeadline did not pass through value")
+	}
+	if !conn.readDeadline.Equal(readDeadline) {
+		t.Fatalf("SetReadDeadline did not pass through value")
+	}
+	if !conn.writeDeadline.Equal(writeDeadline) {
+		t.Fatalf("SetWriteDeadline did not pass through value")
+	}
+}
+
+func TestReadFromFallbackCopiesToConn(t *testing.T) {
+	conn := &noReadFromConn{}
+	proxyConn := NewConn(conn)
+
+	payload := []byte("payload")
+	if _, err := proxyConn.ReadFrom(bytes.NewReader(payload)); err != nil {
+		t.Fatalf("unexpected ReadFrom error: %v", err)
+	}
+
+	// When the inner connection does not implement io.ReaderFrom,
+	// ReadFrom should fall back to io.Copy and write the payload.
+	if !bytes.Equal(conn.written.Bytes(), payload) {
+		t.Fatalf("unexpected write content: %q", conn.written.String())
+	}
+}
+
+func TestWriteToDrainsBufferedData(t *testing.T) {
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	pl := &Listener{Listener: l}
+
+	header := &Header{
+		Version:           2,
+		Command:           PROXY,
+		TransportProtocol: TCPv4,
+		SourceAddr: &net.TCPAddr{
+			IP:   net.ParseIP(testSourceIPv4Addr),
+			Port: 1000,
+		},
+		DestinationAddr: &net.TCPAddr{
+			IP:   net.ParseIP(testDestinationIPv4Addr),
+			Port: 2000,
+		},
+	}
+
+	payload := []byte("ping")
+
+	cliResult := make(chan error)
+	go func() {
+		conn, err := net.Dial("tcp", pl.Addr().String())
+		if err != nil {
+			cliResult <- err
+			return
+		}
+
+		// Write the header followed by payload to populate the reader buffer.
+		if _, err := header.WriteTo(conn); err != nil {
+			cliResult <- err
+			return
+		}
+		if _, err := conn.Write(payload); err != nil {
+			cliResult <- err
+			return
+		}
+
+		// Close the client so WriteTo's io.Copy completes.
+		if err := conn.Close(); err != nil {
+			cliResult <- err
+			return
+		}
+
+		close(cliResult)
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Errorf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	var out bytes.Buffer
+	if _, err := conn.(*Conn).WriteTo(&out); err != nil {
+		t.Fatalf("unexpected WriteTo error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Fatalf("unexpected WriteTo output: %q", out.String())
+	}
+
+	err = <-cliResult
+	if err != nil {
+		t.Fatalf("client error: %v", err)
+	}
+}
+
 func benchmarkTCPProxy(size int, b *testing.B) {
 	// create and start the echo backend
-	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	backend, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		b.Fatalf("err: %v", err)
 	}
-	defer backend.Close()
+	b.Cleanup(func() {
+		if closeErr := backend.Close(); closeErr != nil {
+			b.Errorf("failed to close backend: %v", closeErr)
+		}
+	})
 	go func() {
 		for {
 			conn, err := backend.Accept()
@@ -1610,20 +2389,28 @@ func benchmarkTCPProxy(size int, b *testing.B) {
 				break
 			}
 			_, err = io.Copy(conn, conn)
-			// Can't defer since we keep accepting on each for iteration.
-			_ = conn.Close()
 			if err != nil {
-				panic(fmt.Sprintf("Failed to read entire payload: %v", err))
+				b.Errorf("Failed to read entire payload: %v", err)
+				return
+			}
+			// Can't defer since we keep accepting on each for iteration.
+			if closeErr := conn.Close(); closeErr != nil {
+				b.Errorf("failed to close connection: %v", closeErr)
+				return
 			}
 		}
 	}()
 
 	// start the proxyprotocol enabled tcp proxy
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
 	if err != nil {
 		b.Fatalf("err: %v", err)
 	}
-	defer l.Close()
+	b.Cleanup(func() {
+		if closeErr := l.Close(); closeErr != nil {
+			b.Errorf("failed to close listener: %v", closeErr)
+		}
+	})
 	pl := &Listener{Listener: l}
 	go func() {
 		for {
@@ -1633,21 +2420,32 @@ func benchmarkTCPProxy(size int, b *testing.B) {
 			}
 			bConn, err := net.Dial("tcp", backend.Addr().String())
 			if err != nil {
-				panic(fmt.Sprintf("failed to dial backend: %v", err))
+				b.Errorf("failed to dial backend: %v", err)
+				return
 			}
 			go func() {
 				_, err = io.Copy(bConn, conn)
-				_ = bConn.(*net.TCPConn).CloseWrite()
 				if err != nil {
-					panic(fmt.Sprintf("Failed to proxy incoming data to backend: %v", err))
+					b.Errorf("Failed to proxy incoming data to backend: %v", err)
+					return
+				}
+				if closeErr := bConn.(*net.TCPConn).CloseWrite(); closeErr != nil {
+					b.Errorf("failed to close write: %v", closeErr)
+					return
 				}
 			}()
 			_, err = io.Copy(conn, bConn)
 			if err != nil {
 				panic(fmt.Sprintf("Failed to proxy data from backend: %v", err))
 			}
-			_ = conn.Close()
-			_ = bConn.Close()
+			if closeErr := conn.Close(); closeErr != nil {
+				b.Errorf("failed to close connection: %v", closeErr)
+				return
+			}
+			if closeErr := bConn.Close(); closeErr != nil {
+				b.Errorf("failed to close connection: %v", closeErr)
+				return
+			}
 		}
 	}()
 
@@ -1658,11 +2456,11 @@ func benchmarkTCPProxy(size int, b *testing.B) {
 		Command:           PROXY,
 		TransportProtocol: TCPv4,
 		SourceAddr: &net.TCPAddr{
-			IP:   net.ParseIP("10.1.1.1"),
+			IP:   net.ParseIP(testSourceIPv4Addr),
 			Port: 1000,
 		},
 		DestinationAddr: &net.TCPAddr{
-			IP:   net.ParseIP("20.2.2.2"),
+			IP:   net.ParseIP(testDestinationIPv4Addr),
 			Port: 2000,
 		},
 	}
@@ -1681,9 +2479,13 @@ func benchmarkTCPProxy(size int, b *testing.B) {
 		// send data
 		go func() {
 			_, err = conn.Write(data)
-			_ = conn.(*net.TCPConn).CloseWrite()
 			if err != nil {
-				panic(fmt.Sprintf("Failed to write data: %v", err))
+				b.Errorf("Failed to write data: %v", err)
+				return
+			}
+			if closeErr := conn.(*net.TCPConn).CloseWrite(); closeErr != nil {
+				b.Errorf("failed to close write: %v", closeErr)
+				return
 			}
 		}()
 		// receive data
@@ -1694,7 +2496,10 @@ func benchmarkTCPProxy(size int, b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to read data: %v", err)
 		}
-		conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			b.Errorf("failed to close connection: %v", closeErr)
+			return
+		}
 	}
 }
 
@@ -1730,16 +2535,15 @@ func BenchmarkTCPProxy2048KB(b *testing.B) {
 	benchmarkTCPProxy(2048*1024, b)
 }
 
-// copied from src/net/http/internal/testcert.go
+// copied from src/net/http/internal/testcert.go.
 
 // Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// LocalhostCert is a PEM-encoded TLS cert with SAN IPs
-// "127.0.0.1" and "[::1]", expiring at Jan 29 16:00:00 2084 GMT.
-// generated from src/crypto/tls:
-// go run generate_cert.go  --rsa-bits 1024 --host 127.0.0.1,::1,example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
+// LocalhostCert is a PEM-encoded TLS cert with SAN IPs "127.0.0.1" and "[::1]",
+// expiring at Jan 29 16:00:00 2084 GMT. Generated from src/crypto/tls:
+// go run generate_cert.go  --rsa-bits 1024 --host 127.0.0.1,::1,example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h.
 var LocalhostCert = []byte(`-----BEGIN CERTIFICATE-----
 MIICEzCCAXygAwIBAgIQMIMChMLGrR+QvmQvpwAU6zANBgkqhkiG9w0BAQsFADAS
 MRAwDgYDVQQKEwdBY21lIENvMCAXDTcwMDEwMTAwMDAwMFoYDzIwODQwMTI5MTYw

@@ -1,11 +1,9 @@
+// Package main provides a proxyproto server example.
 package main
 
 import (
-	"io"
 	"log"
 	"net"
-	"strings"
-	"syscall"
 
 	proxyproto "github.com/pires/go-proxyproto"
 )
@@ -20,13 +18,23 @@ func main() {
 
 	// Wrap listener in a proxyproto listener
 	proxyListener := &proxyproto.Listener{Listener: list}
-	defer proxyListener.Close()
+	defer func() {
+		if err := proxyListener.Close(); err != nil {
+			log.Printf("failed to close proxy listener: %v", err)
+		}
+	}()
 
 	// Wait for a connection and accept it
 	conn, err := proxyListener.Accept()
-	defer conn.Close()
-	_, srcIsSyscall := conn.(syscall.Conn)
-	log.Printf("ok ? %v", srcIsSyscall)
+	if err != nil {
+		log.Fatalf("failed to accept connection: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("failed to close connection: %v", err)
+		}
+	}()
+
 	// Print connection details
 	if conn.LocalAddr() == nil {
 		log.Fatal("couldn't retrieve local address")
@@ -37,14 +45,4 @@ func main() {
 		log.Fatal("couldn't retrieve remote address")
 	}
 	log.Printf("remote address: %q", conn.RemoteAddr().String())
-
-	conn2 := conn.(*proxyproto.Conn)
-	bs, _ := conn2.Peek(3)
-	log.Printf("Peeked content: %s", string(bs))
-	var sb strings.Builder
-	_, err = io.Copy(&sb, conn2)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("content: %s", sb.String())
 }

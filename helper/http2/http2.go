@@ -106,6 +106,9 @@ func (srv *Server) Serve(ln net.Listener) error {
 			srv.errorLog().Printf("listener %q: accept error (retrying in %v): %v", ln.Addr(), delay, err)
 			time.Sleep(delay)
 		} else if err != nil {
+			if srv.isClosed() {
+				return http.ErrServerClosed
+			}
 			return fmt.Errorf("failed to accept connection: %w", err)
 		}
 
@@ -163,11 +166,12 @@ func (srv *Server) serveConn(baseCtx context.Context, conn net.Conn) error {
 		}()
 
 		ctx := baseCtx
-		// We don't check if srv.h1.ConnContext is nil so http.Server works the same
-		// with or without this middleware.
-		// For more info, see https://github.com/pires/go-proxyproto/pull/140/changes#r2725568706.
-		if connCtx := srv.h1.ConnContext(ctx, conn); connCtx != nil {
-			ctx = connCtx
+		// Mirror net/http.Server ConnContext behavior.
+		if cc := srv.h1.ConnContext; cc != nil {
+			ctx = cc(ctx, conn)
+			if ctx == nil {
+				panic("ConnContext returned nil")
+			}
 		}
 
 		opts := http2.ServeConnOpts{Context: ctx, BaseConfig: srv.h1}
@@ -196,6 +200,12 @@ func (srv *Server) closeListeners() error {
 		}
 	}
 	return err
+}
+
+func (srv *Server) isClosed() bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.closed
 }
 
 // h1Listener is used to signal back http.Server's Close and Shutdown to the

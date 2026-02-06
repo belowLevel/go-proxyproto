@@ -264,6 +264,116 @@ func TestNewConnSetReadHeaderTimeoutIgnoresNegative(t *testing.T) {
 	}
 }
 
+func TestWithBufferSizePositive(t *testing.T) {
+	conn, peer := net.Pipe()
+	t.Cleanup(func() {
+		_ = conn.Close()
+		_ = peer.Close()
+	})
+
+	proxyConn := NewConn(conn, WithBufferSize(4096))
+	if proxyConn.bufferSize == nil {
+		t.Fatalf("expected bufferSize to be set")
+	}
+	if *proxyConn.bufferSize != 4096 {
+		t.Fatalf("expected bufferSize 4096, got %d", *proxyConn.bufferSize)
+	}
+
+	go func() { _, _ = peer.Write([]byte("x")) }()
+	buf := make([]byte, 1)
+	if _, err := proxyConn.Read(buf); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(buf) != "x" {
+		t.Fatalf("unexpected read: %q", buf)
+	}
+}
+
+func TestWithBufferSizeZeroOrNegative(t *testing.T) {
+	for _, length := range []int{0, -1} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			conn, peer := net.Pipe()
+			t.Cleanup(func() {
+				_ = conn.Close()
+				_ = peer.Close()
+			})
+
+			proxyConn := NewConn(conn, WithBufferSize(length))
+			if proxyConn.bufferSize != nil {
+				t.Fatalf("expected bufferSize to be nil for length %d", length)
+			}
+
+			go func() { _, _ = peer.Write([]byte("y")) }()
+			buf := make([]byte, 1)
+			if _, err := proxyConn.Read(buf); err != nil {
+				t.Fatalf("read failed: %v", err)
+			}
+			if string(buf) != "y" {
+				t.Fatalf("unexpected read: %q", buf)
+			}
+		})
+	}
+}
+
+func TestListenerReadBufferSizeApplied(t *testing.T) {
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	pl := &Listener{Listener: l, ReadBufferSize: 4096}
+
+	go func() {
+		c, _ := net.Dial("tcp", pl.Addr().String())
+		if c != nil {
+			_ = c.Close()
+		}
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	proxyConn := conn.(*Conn)
+	if proxyConn.bufferSize == nil {
+		t.Fatalf("expected bufferSize to be set when Listener.ReadBufferSize > 0")
+	}
+	if *proxyConn.bufferSize != 4096 {
+		t.Fatalf("expected bufferSize 4096, got %d", *proxyConn.bufferSize)
+	}
+}
+
+func TestListenerReadBufferSizeZeroUsesDefault(t *testing.T) {
+	l, err := net.Listen("tcp", testLocalhostRandomPort)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	pl := &Listener{Listener: l, ReadBufferSize: 0}
+
+	go func() {
+		c, _ := net.Dial("tcp", pl.Addr().String())
+		if c != nil {
+			_ = c.Close()
+		}
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	proxyConn := conn.(*Conn)
+	if proxyConn.bufferSize != nil {
+		t.Fatalf("expected bufferSize to be nil when Listener.ReadBufferSize is 0")
+	}
+}
+
 func TestReadHeaderTimeoutRespectsEarlierDeadline(t *testing.T) {
 	const (
 		headerTimeout = 200 * time.Millisecond
@@ -2368,6 +2478,178 @@ func TestWriteToDrainsBufferedData(t *testing.T) {
 	err = <-cliResult
 	if err != nil {
 		t.Fatalf("client error: %v", err)
+	}
+}
+
+// chunkedConn wraps a net.Conn and limits reads to simulate TCP chunking.
+type chunkedConn struct {
+	net.Conn
+	maxRead   int
+	readCalls int
+	bytesRead int
+}
+
+func (c *chunkedConn) Read(b []byte) (int, error) {
+	if len(b) > c.maxRead {
+		b = b[:c.maxRead]
+	}
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.readCalls++
+		c.bytesRead += n
+	}
+	return n, err
+}
+
+// TestConnReadHandlesChunkedPayload verifies Conn.Read does not drop data
+// when the initial TCP read is smaller than the payload.
+func TestConnReadHandlesChunkedPayload(t *testing.T) {
+	const payloadSize = 400
+
+	proxyHeader := []byte("PROXY TCP4 192.168.1.1 192.168.1.2 12345 443\r\n")
+	payload := bytes.Repeat([]byte("X"), payloadSize)
+	fullData := append(proxyHeader, payload...)
+
+	serverConn, clientConn := net.Pipe()
+	defer func() {
+		serverCloseErr := serverConn.Close()
+		clientCloseErr := clientConn.Close()
+		if serverCloseErr != nil || clientCloseErr != nil {
+			t.Errorf("failed to close connection: %v, %v", serverCloseErr, clientCloseErr)
+		}
+	}()
+
+	go func() {
+		_, _ = clientConn.Write(fullData)
+		_ = clientConn.Close()
+	}()
+
+	// Simulate TCP delivering only 256 bytes in first read.
+	chunked := &chunkedConn{Conn: serverConn, maxRead: 256}
+
+	// Create a ProxyProto-wrapped connection.
+	conn := NewConn(chunked)
+	buf := make([]byte, 64)
+	readPayload := make([]byte, 0, payloadSize)
+	for len(readPayload) < payloadSize {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := conn.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+		if n > 0 {
+			readPayload = append(readPayload, buf[:n]...)
+		}
+		if err == io.EOF {
+			break
+		}
+	}
+
+	t.Logf("Sent: %d bytes payload (after %d byte PROXY header)", payloadSize, len(proxyHeader))
+	t.Logf("Read: %d bytes", len(readPayload))
+
+	if len(readPayload) != payloadSize {
+		t.Fatalf("read %d bytes, expected %d", len(readPayload), payloadSize)
+	}
+	if !bytes.Equal(readPayload, payload) {
+		t.Fatalf("payload mismatch")
+	}
+
+	// Ensure the proxy connection read from the underlying conn
+	// and drained all bytes, not just buffered reads.
+	if chunked.readCalls == 0 {
+		t.Fatalf("expected underlying reads to occur")
+	}
+	if chunked.bytesRead <= len(proxyHeader) {
+		t.Fatalf("expected reads beyond header, got %d bytes", chunked.bytesRead)
+	}
+	if chunked.bytesRead != len(fullData) {
+		t.Fatalf("underlying reads=%d bytes, expected %d", chunked.bytesRead, len(fullData))
+	}
+}
+
+func TestReadUsesConnWhenBufReaderNil(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := serverConn.Close(); closeErr != nil {
+			t.Errorf("failed to close server connection: %v", closeErr)
+		}
+	})
+	t.Cleanup(func() {
+		if closeErr := clientConn.Close(); closeErr != nil {
+			t.Errorf("failed to close client connection: %v", closeErr)
+		}
+	})
+
+	proxyConn := NewConn(serverConn)
+	sendSecond := make(chan struct{})
+
+	go func() {
+		_, _ = clientConn.Write([]byte("a"))
+		<-sendSecond
+		_, _ = clientConn.Write([]byte("b"))
+		_ = clientConn.Close()
+	}()
+
+	buf := make([]byte, 1)
+	// First read processes header detection and drains the buffer.
+	if _, err := proxyConn.Read(buf); err != nil {
+		t.Fatalf("first read failed: %v", err)
+	}
+	if proxyConn.bufReader != nil {
+		t.Fatalf("expected bufReader to be nil after draining buffer")
+	}
+
+	// With bufReader cleared, Read should use the underlying conn.
+	close(sendSecond)
+	if _, err := proxyConn.Read(buf); err != nil {
+		t.Fatalf("second read failed: %v", err)
+	}
+	if string(buf) != "b" {
+		t.Fatalf("unexpected second read payload: %q", string(buf))
+	}
+}
+
+func TestWriteToUsesConnWhenBufReaderNil(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		if closeErr := serverConn.Close(); closeErr != nil {
+			t.Errorf("failed to close server connection: %v", closeErr)
+		}
+	})
+	t.Cleanup(func() {
+		if closeErr := clientConn.Close(); closeErr != nil {
+			t.Errorf("failed to close client connection: %v", closeErr)
+		}
+	})
+
+	proxyConn := NewConn(serverConn)
+	sendPayload := make(chan struct{})
+
+	go func() {
+		_, _ = clientConn.Write([]byte("x"))
+		<-sendPayload
+		_, _ = clientConn.Write([]byte("payload"))
+		_ = clientConn.Close()
+	}()
+
+	// Process header detection and drain the buffer.
+	buf := make([]byte, 1)
+	if _, err := proxyConn.Read(buf); err != nil {
+		t.Fatalf("initial read failed: %v", err)
+	}
+	if proxyConn.bufReader != nil {
+		t.Fatalf("expected bufReader to be nil after draining buffer")
+	}
+
+	// With bufReader cleared, WriteTo should copy directly from conn.
+	close(sendPayload)
+	var out bytes.Buffer
+	if _, err := proxyConn.WriteTo(&out); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+	if out.String() != "payload" {
+		t.Fatalf("unexpected WriteTo output: %q", out.String())
 	}
 }
 

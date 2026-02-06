@@ -5,6 +5,7 @@ import (
 	"bytes"
 	iorand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -58,6 +59,12 @@ var (
 	fixtureIPv4V2TLV = fixtureWithTLV(lengthV4Bytes, fixtureIPv4Address, fixtureTLV)
 	fixtureIPv6V2TLV = fixtureWithTLV(lengthV6Bytes, fixtureIPv6Address, fixtureTLV)
 	fixtureUnspecTLV = fixtureWithTLV(lengthUnspecBytes, []byte{}, fixtureTLV)
+
+	fixtureMediumTLV   = make([]byte, 2048)
+	fixtureV2MediumTLV = fixtureWithTLV(lengthV4Bytes, fixtureIPv4Address, fixtureMediumTLV)
+
+	fixtureTooLargeTLV   = make([]byte, 10*1024)
+	fixtureV2TooLargeTLV = fixtureWithTLV(lengthV4Bytes, fixtureIPv4Address, fixtureTooLargeTLV)
 
 	// Arbitrary bytes following proxy bytes.
 	arbitraryTailBytes = []byte{'\x99', '\x97', '\x98'}
@@ -126,12 +133,12 @@ var invalidParseV2Tests = []struct {
 	{
 		desc:          "TCPv4 with mismatching length",
 		reader:        newBufioReader(append(append(SIGV2, byte(PROXY), byte(TCPv4)), lengthV4Bytes...)),
-		expectedError: ErrInvalidLength,
+		expectedError: ErrInvalidAddress,
 	},
 	{
 		desc:          "TCPv6 with mismatching length",
 		reader:        newBufioReader(append(append(SIGV2, byte(PROXY), byte(TCPv6)), lengthV6Bytes...)),
-		expectedError: ErrInvalidLength,
+		expectedError: ErrInvalidAddress,
 	},
 	{
 		desc:          "TCPv4 length zero but with address and ports",
@@ -141,11 +148,16 @@ var invalidParseV2Tests = []struct {
 	{
 		desc:          "TCPv6 with IPv6 length but IPv4 address and ports",
 		reader:        newBufioReader(append(append(append(SIGV2, byte(PROXY), byte(TCPv6)), lengthV6Bytes...), fixtureIPv4Address...)),
-		expectedError: ErrInvalidLength,
+		expectedError: ErrInvalidAddress,
 	},
 	{
 		desc:          "unspec length greater than zero but no TLVs",
 		reader:        newBufioReader(append(append(SIGV2, byte(LOCAL), byte(UNSPEC)), fixtureUnspecTLV[:2]...)),
+		expectedError: ErrInvalidLength,
+	},
+	{
+		desc:          "TCPv4 with too large TLV",
+		reader:        newBufioReader(append(append(SIGV2, byte(PROXY), byte(TCPv4)), fixtureV2TooLargeTLV...)),
 		expectedError: ErrInvalidLength,
 	},
 }
@@ -153,7 +165,7 @@ var invalidParseV2Tests = []struct {
 func TestParseV2Invalid(t *testing.T) {
 	for _, tt := range invalidParseV2Tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			if _, err := Read(tt.reader); err != tt.expectedError {
+			if _, err := Read(tt.reader); !errors.Is(err, tt.expectedError) {
 				t.Fatalf("expected %v, actual %v", tt.expectedError, err)
 			}
 		})
@@ -287,6 +299,18 @@ var validParseAndWriteV2Tests = []struct {
 			TransportProtocol: UnixDatagram,
 			SourceAddr:        unixDatagramAddr,
 			DestinationAddr:   unixDatagramAddr,
+		},
+	},
+	{
+		desc:   "proxy TCPv4 with medium TLV",
+		reader: newBufioReader(append(append(SIGV2, byte(PROXY), byte(TCPv4)), fixtureV2MediumTLV...)),
+		expectedHeader: &Header{
+			Version:           2,
+			Command:           PROXY,
+			TransportProtocol: TCPv4,
+			SourceAddr:        v4addr,
+			DestinationAddr:   v4addr,
+			rawTLVs:           fixtureMediumTLV,
 		},
 	},
 }

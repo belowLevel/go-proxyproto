@@ -16,9 +16,11 @@ import (
 
 // readBufferSize is the size used for bufio.Reader's internal buffer.
 //
-// For v1 the header length is at most 108 bytes.
-// For v2 the header length is at most 52 bytes plus the length of the TLVs.
-// We use 256 bytes to be safe.
+// This is kept low to reduce per-connection memory overhead. If the header is
+// larger than readBufferSize, the header will be decoded with multiple Read
+// calls. For v1 the header length is at most 108 bytes. For v2 the header
+// length is at most 52 bytes plus the length of the TLVs. We use 256 bytes to
+// accommodate for the most common cases.
 const readBufferSize = 256
 
 var (
@@ -32,9 +34,11 @@ var (
 	// is not trusted, and therefore is invalid.
 	ErrInvalidUpstream = fmt.Errorf("proxyproto: upstream connection address not trusted for PROXY information")
 
-	PeekBufferNotEmpty = errors.New("peek buffer not empty")
+	ErrPeekBufferNotEmpty = errors.New("peek buffer not empty")
 
-	NotSyscall = errors.New("underlying conn not syscall.Conn")
+	ErrNotSyscall = errors.New("underlying conn not syscall.Conn")
+
+	ErrBufReaderIsNil = errors.New("bufreader is nill")
 )
 
 // Listener is used to wrap an underlying listener,
@@ -48,13 +52,20 @@ var (
 // Only one of Policy or ConnPolicy should be provided. If both are provided then
 // a panic would occur during accept.
 type Listener struct {
+	// Listener is the underlying listener.
 	Listener net.Listener
 	// Deprecated: use ConnPolicyFunc instead. This will be removed in future release.
-	Policy            PolicyFunc
-	ConnPolicy        ConnPolicyFunc
-	ValidateHeader    Validator
+	Policy PolicyFunc
+	// ConnPolicy is the policy function for accepted connections.
+	ConnPolicy ConnPolicyFunc
+	// ValidateHeader is the validator function for the proxy header.
+	ValidateHeader Validator
+	// ReadHeaderTimeout is the timeout for reading the proxy header.
 	ReadHeaderTimeout time.Duration
 	LimitChan         chan struct{}
+	// ReadBufferSize is the read buffer size for accepted connections. When > 0,
+	// each accepted connection uses this size for proxy header detection; 0 means default.
+	ReadBufferSize int
 }
 
 // Conn is used to wrap and underlying connection which
@@ -62,15 +73,17 @@ type Listener struct {
 // return the address of the client instead of the proxy address. Each connection
 // will have its own readHeaderTimeout and readDeadline set by the Accept() call.
 type Conn struct {
-	readDeadline      atomic.Value  `json:"-"` // time.Time
-	once              sync.Once     `json:"-"`
-	readErr           error         `json:"-"`
-	conn              net.Conn      `json:"-"`
-	bufReader         *bufio.Reader `json:"-"`
-	header            *Header       `json:"-"`
-	ProxyHeaderPolicy Policy        `json:"-"`
-	Validate          Validator     `json:"-"`
-	readHeaderTimeout time.Duration `json:"-"`
+	readDeadline atomic.Value
+	once         sync.Once
+	readErr      error
+	conn         net.Conn
+	bufReader    *bufio.Reader
+	// bufferSize is set when the client overrides via WithBufferSize; nil means use default.
+	bufferSize        *int
+	header            *Header
+	ProxyHeaderPolicy Policy    `json:"-"`
+	Validate          Validator `json:"-"`
+	readHeaderTimeout time.Duration
 
 	UUID      uuid.UUID `json:"id"`
 	manager   *Manager  `json:"-"`
@@ -103,6 +116,22 @@ func SetReadHeaderTimeout(t time.Duration) func(*Conn) {
 	}
 }
 
+// WithBufferSize sets the size of the read buffer used for proxy header detection.
+// Values <= 0 are ignored and the default (256 bytes) is used. Values < 16 are
+// effectively 16 due to bufio's minimum. The default is tuned for typical proxy
+// protocol header lengths.
+func WithBufferSize(length int) func(*Conn) {
+	return func(c *Conn) {
+		if length <= 0 {
+			return
+		}
+		p := new(int)
+		*p = length
+		c.bufferSize = p
+		c.bufReader = bufio.NewReaderSize(c.conn, length)
+	}
+}
+
 // Accept waits for and returns the next valid connection to the listener.
 func (p *Listener) Accept() (net.Conn, error) {
 	for {
@@ -117,7 +146,7 @@ func (p *Listener) Accept() (net.Conn, error) {
 			case p.LimitChan <- struct{}{}:
 			default:
 				{
-					conn.Close()
+					_ = conn.Close()
 					continue
 				}
 			}
@@ -155,11 +184,14 @@ func (p *Listener) Accept() (net.Conn, error) {
 			}
 		}
 
-		newConn := NewConn(
-			conn,
+		opts := []func(*Conn){
 			WithPolicy(proxyHeaderPolicy),
 			ValidateHeader(p.ValidateHeader),
-		)
+		}
+		if p.ReadBufferSize > 0 {
+			opts = append(opts, WithBufferSize(p.ReadBufferSize))
+		}
+		newConn := NewConn(conn, opts...)
 
 		newConn.Start = time.Now()
 		newConn.Addr = p.Listener.Addr().String()
@@ -220,19 +252,42 @@ func (p *Conn) Read(b []byte) (int, error) {
 	if err := p.ensureHeaderProcessed(); err != nil {
 		return 0, err
 	}
-	if p.bufReader == nil {
-		return 0, io.EOF
+
+	// Drain the buffer if it exists and has data.
+	if p.bufReader != nil {
+		if p.bufReader.Buffered() > 0 {
+			n, err := p.bufReader.Read(b)
+
+			// Did we empty the buffer?
+			// Buffering a net.Conn means the buffer doesn't return io.EOF until the connection returns io.EOF.
+			// Therefore, we use Buffered() == 0 to detect if we are done with the buffer.
+			if p.bufReader.Buffered() == 0 {
+				// Garbage collect the buffer.
+				p.bufReader = nil
+			}
+
+			// Return immediately. Do not touch p.conn.
+			// If err is EOF here, it means the connection is actually closed,
+			// so we should return that error to the user anyway.
+			return n, err
+		}
+		// If buffer was empty to begin with (shouldn't happen with the >0 check
+		// but good for safety), clear it.
+		p.bufReader = nil
 	}
-	return p.bufReader.Read(b)
+
+	// From now on, read directly from the underlying connection.
+	return p.conn.Read(b)
 }
 
 func (p *Conn) Peek(n int) ([]byte, error) {
-	p.once.Do(func() {
-		p.readErr = p.readHeader()
-	})
+	if err := p.ensureHeaderProcessed(); err != nil {
+		return nil, err
+	}
 	p.RemoteAdd = p.RemoteAddr().String()
-	if p.readErr != nil {
-		return nil, p.readErr
+
+	if p.bufReader == nil {
+		return nil, ErrBufReaderIsNil
 	}
 	return p.bufReader.Peek(n)
 }
@@ -466,6 +521,11 @@ func (p *Conn) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 
+	// If the buffer has been drained (or cleared), copy directly from conn.
+	if p.bufReader == nil {
+		return io.Copy(w, p.conn)
+	}
+
 	b := make([]byte, p.bufReader.Buffered())
 	if _, err := p.bufReader.Read(b); err != nil {
 		return 0, err // this should never happen as we read buffered data.
@@ -491,12 +551,12 @@ func (p *Conn) WriteTo(w io.Writer) (int64, error) {
 }
 func (p *Conn) SyscallConn() (syscall.RawConn, error) {
 	if p.bufReader.Buffered() > 0 {
-		return nil, PeekBufferNotEmpty
+		return nil, ErrPeekBufferNotEmpty
 	}
 	if sc, ok := p.conn.(syscall.Conn); ok {
 		return sc.SyscallConn()
 	}
-	return nil, NotSyscall
+	return nil, ErrNotSyscall
 }
 
 func (p *Conn) FlushPeekedTo(w io.Writer) error {
@@ -542,10 +602,6 @@ func (p *Conn) ID() string {
 	return p.UUID.String()
 }
 
-const (
-	defaultBufSize = 4096
-)
-
 type Manager struct {
 	connections *xsync.Map[string, *Conn]
 }
@@ -559,7 +615,7 @@ func (m *Manager) Leave(c *Conn) {
 }
 
 func (m *Manager) Snapshot() []*Conn {
-	var connections []*Conn = make([]*Conn, 0)
+	var connections = make([]*Conn, 0)
 	m.connections.Range(func(key string, value *Conn) bool {
 		connections = append(connections, value)
 		return true

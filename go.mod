@@ -1,6 +1,6 @@
 module github.com/pires/go-proxyproto
 
-go 1.24.0
+go 1.25
 
 require (
 	github.com/gofrs/uuid/v5 v5.4.0

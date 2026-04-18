@@ -1,13 +1,13 @@
 module github.com/pires/go-proxyproto
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/gofrs/uuid/v5 v5.4.0
 	github.com/metacubex/randv2 v0.2.0
-	github.com/puzpuzpuz/xsync/v4 v4.4.0
-	golang.org/x/net v0.49.0
-	golang.org/x/sys v0.40.0
+	github.com/puzpuzpuz/xsync/v4 v4.5.0
+	golang.org/x/net v0.53.0
+	golang.org/x/sys v0.43.0
 )
 
-require golang.org/x/text v0.33.0 // indirect
+require golang.org/x/text v0.36.0 // indirect

@@ -20,6 +20,11 @@ const (
 	testIP6LongAddr         = "1234:5678:9abc:def0:cafe:babe:dead:2bad"
 	testValidPort           = 65533
 	testInvalidPort         = 99999
+
+	// Unix-domain address names reused across address fixtures in tests.
+	testUnixSocketName = "socket"
+	testUnixSrcName    = "src"
+	testUnixDstName    = "dst"
 )
 
 var (
@@ -32,8 +37,8 @@ var (
 	v4UDPAddr net.Addr = &net.UDPAddr{IP: v4ip, Port: testValidPort}
 	v6UDPAddr net.Addr = &net.UDPAddr{IP: v6ip, Port: testValidPort}
 
-	unixStreamAddr   net.Addr = &net.UnixAddr{Net: "unix", Name: "socket"}
-	unixDatagramAddr net.Addr = &net.UnixAddr{Net: "unixgram", Name: "socket"}
+	unixStreamAddr   net.Addr = &net.UnixAddr{Net: networkUnix, Name: testUnixSocketName}
+	unixDatagramAddr net.Addr = &net.UnixAddr{Net: networkUnixgram, Name: testUnixSocketName}
 
 	errReadIntentionallyBroken = errors.New("read is intentionally broken")
 )
@@ -241,21 +246,21 @@ func TestGetters(t *testing.T) {
 				Command:           PROXY,
 				TransportProtocol: UnixStream,
 				SourceAddr: &net.UnixAddr{
-					Net:  "unix",
-					Name: "src",
+					Net:  networkUnix,
+					Name: testUnixSrcName,
 				},
 				DestinationAddr: &net.UnixAddr{
-					Net:  "unix",
-					Name: "dst",
+					Net:  networkUnix,
+					Name: testUnixDstName,
 				},
 			},
 			unixSourceAddr: &net.UnixAddr{
-				Net:  "unix",
-				Name: "src",
+				Net:  networkUnix,
+				Name: testUnixSrcName,
 			},
 			unixDestAddr: &net.UnixAddr{
-				Net:  "unix",
-				Name: "dst",
+				Net:  networkUnix,
+				Name: testUnixDstName,
 			},
 		},
 		{
@@ -265,21 +270,21 @@ func TestGetters(t *testing.T) {
 				Command:           PROXY,
 				TransportProtocol: UnixDatagram,
 				SourceAddr: &net.UnixAddr{
-					Net:  "unix",
-					Name: "src",
+					Net:  networkUnix,
+					Name: testUnixSrcName,
 				},
 				DestinationAddr: &net.UnixAddr{
-					Net:  "unix",
-					Name: "dst",
+					Net:  networkUnix,
+					Name: testUnixDstName,
 				},
 			},
 			unixSourceAddr: &net.UnixAddr{
-				Net:  "unix",
-				Name: "src",
+				Net:  networkUnix,
+				Name: testUnixSrcName,
 			},
 			unixDestAddr: &net.UnixAddr{
-				Net:  "unix",
-				Name: "dst",
+				Net:  networkUnix,
+				Name: testUnixDstName,
 			},
 		},
 		{
@@ -427,7 +432,8 @@ func TestWriteTo(t *testing.T) {
 	}
 
 	if _, err := invalidHeader.WriteTo(&buf); err == nil {
-		t.Fatalf("should have thrown error %q", err.Error())
+		// err is nil in this branch, so don't format it (would nil-deref).
+		t.Fatal("should have thrown error")
 	}
 }
 
@@ -598,6 +604,33 @@ func TestHeaderProxyFromAddrs(t *testing.T) {
 			},
 		},
 		{
+			// Mixed family (v4 source, genuine v6 dest) must resolve to TCPv6, not
+			// TCPv4. The old source-only logic chose TCPv4 here and then errored in
+			// formatVersion1; see the both-ends family selection in header.go.
+			name: "TCPv4SrcIPv6Dst",
+			sourceAddr: &net.TCPAddr{
+				IP:   net.ParseIP(testSourceIPv4Addr),
+				Port: 1000,
+			},
+			destAddr: &net.TCPAddr{
+				IP:   net.ParseIP("fde7::1"),
+				Port: 2000,
+			},
+			expected: &Header{
+				Version:           2,
+				Command:           PROXY,
+				TransportProtocol: TCPv6,
+				SourceAddr: &net.TCPAddr{
+					IP:   net.ParseIP(testSourceIPv4Addr),
+					Port: 1000,
+				},
+				DestinationAddr: &net.TCPAddr{
+					IP:   net.ParseIP("fde7::1"),
+					Port: 2000,
+				},
+			},
+		},
+		{
 			name: "UDPv4",
 			sourceAddr: &net.UDPAddr{
 				IP:   net.ParseIP(testSourceIPv4Addr),
@@ -648,48 +681,48 @@ func TestHeaderProxyFromAddrs(t *testing.T) {
 		{
 			name: "UnixStream",
 			sourceAddr: &net.UnixAddr{
-				Net:  "unix",
-				Name: "src",
+				Net:  networkUnix,
+				Name: testUnixSrcName,
 			},
 			destAddr: &net.UnixAddr{
-				Net:  "unix",
-				Name: "dst",
+				Net:  networkUnix,
+				Name: testUnixDstName,
 			},
 			expected: &Header{
 				Version:           2,
 				Command:           PROXY,
 				TransportProtocol: UnixStream,
 				SourceAddr: &net.UnixAddr{
-					Net:  "unix",
-					Name: "src",
+					Net:  networkUnix,
+					Name: testUnixSrcName,
 				},
 				DestinationAddr: &net.UnixAddr{
-					Net:  "unix",
-					Name: "dst",
+					Net:  networkUnix,
+					Name: testUnixDstName,
 				},
 			},
 		},
 		{
 			name: "UnixDatagram",
 			sourceAddr: &net.UnixAddr{
-				Net:  "unixgram",
-				Name: "src",
+				Net:  networkUnixgram,
+				Name: testUnixSrcName,
 			},
 			destAddr: &net.UnixAddr{
-				Net:  "unixgram",
-				Name: "dst",
+				Net:  networkUnixgram,
+				Name: testUnixDstName,
 			},
 			expected: &Header{
 				Version:           2,
 				Command:           PROXY,
 				TransportProtocol: UnixDatagram,
 				SourceAddr: &net.UnixAddr{
-					Net:  "unixgram",
-					Name: "src",
+					Net:  networkUnixgram,
+					Name: testUnixSrcName,
 				},
 				DestinationAddr: &net.UnixAddr{
-					Net:  "unixgram",
-					Name: "dst",
+					Net:  networkUnixgram,
+					Name: testUnixDstName,
 				},
 			},
 		},
@@ -769,11 +802,26 @@ func TestHeaderProxyFromAddrs(t *testing.T) {
 		{
 			name: "UnixAddrTypeMismatch",
 			sourceAddr: &net.UnixAddr{
-				Net: "unix",
+				Net: networkUnix,
 			},
 			destAddr: &net.TCPAddr{
 				IP:   net.ParseIP(testDestinationIPv4Addr),
 				Port: 2000,
+			},
+			expected: unspec,
+		},
+		{
+			// Stream source paired with a datagram destination is not a coherent
+			// connection, so the header stays UNSPEC instead of adopting the
+			// source's flavor.
+			name: "UnixNetMismatch",
+			sourceAddr: &net.UnixAddr{
+				Net:  networkUnix,
+				Name: testUnixSrcName,
+			},
+			destAddr: &net.UnixAddr{
+				Net:  networkUnixgram,
+				Name: testUnixDstName,
 			},
 			expected: unspec,
 		},

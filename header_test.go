@@ -79,6 +79,159 @@ func TestReadTimeoutPropagatesReadError(t *testing.T) {
 	}
 }
 
+func TestReadHeaderTimeoutParsesHeaderAndPreservesPayload(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	const payload = "hello"
+	go func() {
+		_, _ = client.Write([]byte("PROXY TCP4 127.0.0.1 127.0.0.2 12345 443\r\n" + payload))
+		_ = client.Close()
+	}()
+
+	reader := bufio.NewReader(server)
+	h, err := ReadHeaderTimeout(server, reader, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h == nil || h.Version != 1 {
+		t.Fatalf("expected a v1 header, got %+v", h)
+	}
+
+	// Bytes buffered past the header must remain readable by the caller.
+	got := make([]byte, len(payload))
+	n, err := reader.Read(got)
+	if err != nil {
+		t.Fatalf("reading buffered payload: %v", err)
+	}
+	if string(got[:n]) != payload {
+		t.Fatalf("expected payload %q, got %q", payload, string(got[:n]))
+	}
+}
+
+func TestReadHeaderTimeoutCancelsStalledRead(t *testing.T) {
+	// The peer connects but never sends anything. Without a real deadline this
+	// would block forever (the failure the deprecated ReadTimeout leaks on);
+	// ReadHeaderTimeout has the conn, so its deadline actually fires.
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	reader := bufio.NewReader(server)
+	start := time.Now()
+	h, err := ReadHeaderTimeout(server, reader, 50*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err != ErrNoProxyProtocol {
+		t.Fatalf("expected %v, got %v", ErrNoProxyProtocol, err)
+	}
+	if h != nil {
+		t.Fatalf("expected nil header, got %+v", h)
+	}
+	// Generous slack for slow CI; the point is that it returns at all.
+	if elapsed > 2*time.Second {
+		t.Fatalf("read did not cancel promptly: elapsed=%v", elapsed)
+	}
+}
+
+func TestReadHeaderTimeoutNoHeaderPreservesData(t *testing.T) {
+	// The peer sends non-PROXY data. ReadHeaderTimeout must report "no header"
+	// without consuming those bytes, so the caller can still read them.
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	const want = "GET / HTTP/1.1\r\n"
+	go func() {
+		_, _ = client.Write([]byte(want))
+		_ = client.Close()
+	}()
+
+	reader := bufio.NewReader(server)
+	h, err := ReadHeaderTimeout(server, reader, time.Second)
+	if err != ErrNoProxyProtocol {
+		t.Fatalf("expected %v, got %v", ErrNoProxyProtocol, err)
+	}
+	if h != nil {
+		t.Fatalf("expected nil header, got %+v", h)
+	}
+
+	got := make([]byte, len(want))
+	n, err := reader.Read(got)
+	if err != nil {
+		t.Fatalf("reading preserved data: %v", err)
+	}
+	if string(got[:n]) != want {
+		t.Fatalf("non-PROXY data not preserved: got %q", string(got[:n]))
+	}
+}
+
+func TestReadHeaderTimeoutZeroTimeoutReadsWithoutDeadline(t *testing.T) {
+	// A timeout <= 0 must skip the deadline entirely and still read a header.
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	go func() {
+		_, _ = client.Write([]byte("PROXY TCP4 10.1.1.1 20.2.2.2 1000 2000\r\n"))
+		_ = client.Close()
+	}()
+
+	reader := bufio.NewReader(server)
+	h, err := ReadHeaderTimeout(server, reader, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h == nil || h.SourceAddr.String() != "10.1.1.1:1000" {
+		t.Fatalf("unexpected header: %+v", h)
+	}
+}
+
+func TestReadHeaderTimeoutInitialDeadlineError(t *testing.T) {
+	// If arming the deadline fails, the error is returned and no read is done.
+	inner := &deadlineFailConn{
+		r:         bytes.NewReader([]byte("PROXY TCP4 10.1.1.1 20.2.2.2 1000 2000\r\n")),
+		failOnSet: 1,
+	}
+	reader := bufio.NewReader(inner)
+	if _, err := ReadHeaderTimeout(inner, reader, time.Second); !errors.Is(err, errDeadlineFail) {
+		t.Fatalf("expected the SetReadDeadline error, got %v", err)
+	}
+	if inner.setCalls != 1 {
+		t.Fatalf("expected exactly one SetReadDeadline call, got %d", inner.setCalls)
+	}
+}
+
+func TestReadHeaderTimeoutPropagatesParseError(t *testing.T) {
+	// A valid PROXY v1 signature but an invalid body must surface the parse
+	// error, not be masked as ErrNoProxyProtocol.
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	go func() {
+		_, _ = client.Write([]byte("PROXY TCP4 10.1.1.1 20.2.2.2 notaport 2000\r\n"))
+		_ = client.Close()
+	}()
+
+	reader := bufio.NewReader(server)
+	_, err := ReadHeaderTimeout(server, reader, time.Second)
+	if err == nil || err == ErrNoProxyProtocol {
+		t.Fatalf("expected a parse error, got %v", err)
+	}
+}
+
 func TestEqualsTo(t *testing.T) {
 	var headersEqual = []struct {
 		this, that *Header
@@ -165,6 +318,15 @@ func TestEqualsTo(t *testing.T) {
 		if actual := tt.this.EqualsTo(tt.that); actual != tt.expected {
 			t.Fatalf("expected %t, actual %t", tt.expected, actual)
 		}
+	}
+}
+
+func TestEqualToDeprecatedWrapper(t *testing.T) {
+	// EqualTo is kept only for compatibility; this test locks it to the same
+	// behavior as EqualsTo so the deprecated wrapper cannot drift before removal.
+	header := testTCPv4Header()
+	if !header.EqualTo(header) {
+		t.Fatal("EqualTo did not delegate to EqualsTo")
 	}
 }
 

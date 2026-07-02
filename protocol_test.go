@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -291,10 +292,197 @@ func TestNewConnSetReadHeaderTimeoutIgnoresNegative(t *testing.T) {
 	closeOnCleanup(t, "connection", conn)
 	closeOnCleanup(t, "peer connection", peer)
 
-	// Negative values should be ignored, leaving the timeout unset.
+	// Negative values are ignored, leaving the NewConn default in place.
 	proxyConn := NewConn(conn, SetReadHeaderTimeout(-1))
+	if proxyConn.readHeaderTimeout != DefaultReadHeaderTimeout {
+		t.Fatalf("expected readHeaderTimeout %v, got %v", DefaultReadHeaderTimeout, proxyConn.readHeaderTimeout)
+	}
+}
+
+func TestNewConnAppliesDefaultReadHeaderTimeout(t *testing.T) {
+	conn, peer := net.Pipe()
+	closeOnCleanup(t, "connection", conn)
+	closeOnCleanup(t, "peer connection", peer)
+
+	// A bare NewConn is safe-by-default: it applies DefaultReadHeaderTimeout so
+	// PROXY header detection is bounded. (Detection only — under the default USE
+	// policy the first Read can still block on a silent client; see
+	// TestNewConnDefaultTimeoutBoundsHeaderDetection.)
+	proxyConn := NewConn(conn)
+	if proxyConn.readHeaderTimeout != DefaultReadHeaderTimeout {
+		t.Fatalf("expected default readHeaderTimeout %v, got %v", DefaultReadHeaderTimeout, proxyConn.readHeaderTimeout)
+	}
+}
+
+func TestNewConnSetReadHeaderTimeoutZeroDisables(t *testing.T) {
+	conn, peer := net.Pipe()
+	closeOnCleanup(t, "connection", conn)
+	closeOnCleanup(t, "peer connection", peer)
+
+	// Zero explicitly disables the timeout, overriding the NewConn default.
+	proxyConn := NewConn(conn, SetReadHeaderTimeout(0))
 	if proxyConn.readHeaderTimeout != 0 {
-		t.Fatalf("expected readHeaderTimeout to remain 0, got %v", proxyConn.readHeaderTimeout)
+		t.Fatalf("expected readHeaderTimeout 0 (disabled), got %v", proxyConn.readHeaderTimeout)
+	}
+}
+
+// TestReadHeaderPreservesHeaderWhenDeadlineRestoreFails locks in the fix where a
+// successfully parsed header must not be discarded if restoring the read
+// deadline afterwards fails (e.g. a net.Pipe whose peer closed right after
+// sending the header).
+func TestReadHeaderPreservesHeaderWhenDeadlineRestoreFails(t *testing.T) {
+	// A full PROXY v1 header followed by application data.
+	data := append([]byte("PROXY TCP4 10.1.1.1 20.2.2.2 1000 2000\r\n"), []byte("ping")...)
+	// Succeed the arming SetReadDeadline (call 1), fail the restore (call 2).
+	inner := &deadlineFailConn{r: bytes.NewReader(data), failOnSet: 2}
+
+	// NewConn applies DefaultReadHeaderTimeout (> 0), so readHeader arms and then
+	// restores a deadline around the header read.
+	proxyConn := NewConn(inner)
+
+	header := proxyConn.ProxyHeader()
+	if header == nil {
+		t.Fatal("header was discarded when the deadline restore failed")
+	}
+	if got := header.SourceAddr.String(); got != "10.1.1.1:1000" {
+		t.Fatalf("unexpected source addr %q", got)
+	}
+	if inner.setCalls != 2 {
+		t.Fatalf("expected arming + restore SetReadDeadline calls, got %d", inner.setCalls)
+	}
+
+	// Header processing must not have surfaced the restore error, and the
+	// buffered application bytes must still be readable.
+	buf := make([]byte, 4)
+	n, err := proxyConn.Read(buf)
+	if err != nil {
+		t.Fatalf("unexpected read error after header: %v", err)
+	}
+	if string(buf[:n]) != "ping" {
+		t.Fatalf("expected buffered payload %q, got %q", "ping", string(buf[:n]))
+	}
+}
+
+// TestNewConnDefaultTimeoutBoundsHeaderDetection verifies what the NewConn
+// default actually bounds: PROXY header *detection*. A peer that connects but
+// never sends data cannot make header processing block forever. This is
+// detection only — under the default (USE) policy a subsequent Read still falls
+// through to the raw connection and can block, which is why this test drives
+// ProxyHeader, not Read. See TestNewConnRequirePolicyTimeoutUnblocksRead for the
+// end-to-end Read bound, which holds only under REQUIRE.
+func TestNewConnDefaultTimeoutBoundsHeaderDetection(t *testing.T) {
+	orig := DefaultReadHeaderTimeout
+	DefaultReadHeaderTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { DefaultReadHeaderTimeout = orig })
+
+	conn, peer := net.Pipe()
+	closeOnCleanup(t, "connection", conn)
+	closeOnCleanup(t, "peer connection", peer)
+	// peer never writes.
+
+	proxyConn := NewConn(conn) // no options: the default timeout applies
+
+	done := make(chan *Header, 1)
+	start := time.Now()
+	go func() { done <- proxyConn.ProxyHeader() }()
+
+	select {
+	case header := <-done:
+		if header != nil {
+			t.Fatalf("expected no header on a silent connection, got %+v", header)
+		}
+		if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+			t.Fatalf("header detection returned too early (%v); timeout may not have run", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bare NewConn did not bound header detection: ProxyHeader blocked")
+	}
+}
+
+// TestNewConnRequirePolicyTimeoutUnblocksRead verifies the end-to-end guarantee
+// that does hold: under the REQUIRE policy a silent client makes the first Read
+// itself return (with ErrNoProxyProtocol) within the header timeout, instead of
+// falling through to a blocking raw read as the default (USE) policy does.
+func TestNewConnRequirePolicyTimeoutUnblocksRead(t *testing.T) {
+	orig := DefaultReadHeaderTimeout
+	DefaultReadHeaderTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { DefaultReadHeaderTimeout = orig })
+
+	conn, peer := net.Pipe()
+	closeOnCleanup(t, "connection", conn)
+	closeOnCleanup(t, "peer connection", peer)
+	// peer never writes.
+
+	proxyConn := NewConn(conn, WithPolicy(REQUIRE))
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		buf := make([]byte, 1)
+		n, err := proxyConn.Read(buf)
+		done <- result{n, err}
+	}()
+
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, ErrNoProxyProtocol) {
+			t.Fatalf("expected Read to fail with %v, got n=%d err=%v", ErrNoProxyProtocol, r.n, r.err)
+		}
+		if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+			t.Fatalf("Read returned too early (%v); timeout may not have run", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("REQUIRE policy: first Read did not return within the header timeout on a silent client")
+	}
+}
+
+// TestAcceptConcurrentDoesNotRaceOnReadHeaderTimeout runs many Accept calls
+// concurrently. Under -race this guards the fix that stopped Accept from writing
+// the resolved timeout back onto the shared Listener.
+func TestAcceptConcurrentDoesNotRaceOnReadHeaderTimeout(t *testing.T) {
+	l := newLocalListener(t)
+	// ReadHeaderTimeout unset: every Accept resolves the default concurrently.
+	pl := &Listener{Listener: l}
+
+	const n = 8
+	errCh := make(chan error, n)
+	connCh := make(chan net.Conn, n)
+
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			c, err := pl.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			connCh <- c
+		})
+	}
+
+	for range n {
+		c, err := net.Dial("tcp", pl.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		_ = c.Close()
+	}
+
+	wg.Wait()
+	close(errCh)
+	close(connCh)
+	for err := range errCh {
+		t.Fatalf("accept: %v", err)
+	}
+	for c := range connCh {
+		_ = c.Close()
+	}
+	if pl.ReadHeaderTimeout != 0 {
+		t.Fatalf("Accept mutated shared Listener.ReadHeaderTimeout: got %v, want 0", pl.ReadHeaderTimeout)
 	}
 }
 
@@ -578,6 +766,36 @@ func TestReadHeaderTimeoutIsReset(t *testing.T) {
 	h := conn.(*Conn).ProxyHeader()
 	if !h.EqualsTo(header) {
 		t.Errorf("bad: %v", h)
+	}
+	expectClientOK(t, cliResult)
+}
+
+func TestAcceptDoesNotMutateListenerReadHeaderTimeout(t *testing.T) {
+	l := newLocalListener(t)
+
+	// ReadHeaderTimeout is left unset (0): Accept must resolve the default into
+	// the connection without writing it back onto the shared Listener.
+	pl := &Listener{Listener: l}
+
+	cliResult := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("tcp", pl.Addr().String())
+		if err != nil {
+			cliResult <- err
+			return
+		}
+		closeOnCleanup(t, "client connection", c)
+		close(cliResult)
+	}()
+
+	conn, err := pl.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	closeOnCleanup(t, "connection", conn)
+
+	if pl.ReadHeaderTimeout != 0 {
+		t.Fatalf("Accept mutated Listener.ReadHeaderTimeout: got %v, want 0", pl.ReadHeaderTimeout)
 	}
 	expectClientOK(t, cliResult)
 }
@@ -1333,10 +1551,11 @@ func Test_ConnectionErrorsWhenHeaderValidationFails(t *testing.T) {
 }
 
 func Test_ConnectionHandlesInvalidUpstreamError(t *testing.T) {
-	l, err := net.Listen("tcp", "localhost:8080")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("error creating listener: %v", err)
 	}
+	t.Cleanup(func() { _ = l.Close() })
 
 	var connectionCounter atomic.Int32
 
@@ -1355,22 +1574,22 @@ func Test_ConnectionHandlesInvalidUpstreamError(t *testing.T) {
 		},
 	}
 
-	// Kick off the listener and return any error via the chanel.
-	errCh := make(chan error)
-	defer close(errCh)
+	// Kick off the listener and return any error via the channel.
+	errCh := make(chan error, 1)
 	go func() {
 		_, err := newLn.Accept()
 		errCh <- err
 	}()
 
 	client := http.Client{Timeout: 200 * time.Millisecond}
+	url := "http://" + l.Addr().String()
 
 	// Make two calls to trigger the listener's accept, the first should experience
 	// the ErrInvalidUpstream and keep the listener open, the second should experience
 	// a different error which will cause the listener to close.
 
 	// First call should experience the ErrInvalidUpstream and keep the listener open.
-	resp, err := client.Get("http://localhost:8080")
+	resp, err := client.Get(url)
 	if resp != nil {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			t.Fatalf("failed to close response body: %v", closeErr)
@@ -1402,7 +1621,7 @@ func Test_ConnectionHandlesInvalidUpstreamError(t *testing.T) {
 	}
 
 	// Second call should experience a different error and cause the listener to close.
-	resp, err = client.Get("http://localhost:8080")
+	resp, err = client.Get(url)
 	if resp != nil {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			t.Fatalf("failed to close response body: %v", closeErr)
@@ -1736,6 +1955,34 @@ type dummyAddr string
 func (a dummyAddr) Network() string { return "dummy" }
 func (a dummyAddr) String() string  { return string(a) }
 
+// errDeadlineFail simulates a connection (e.g. a net.Pipe whose peer has closed)
+// that rejects SetReadDeadline.
+var errDeadlineFail = errors.New("set read deadline failed")
+
+// deadlineFailConn serves a fixed byte stream and can be told to fail a specific
+// SetReadDeadline call (1-based, 0 = never). It lets tests reproduce a deadline
+// operation that fails after a header has already been parsed.
+type deadlineFailConn struct {
+	r         *bytes.Reader
+	setCalls  int
+	failOnSet int
+}
+
+func (c *deadlineFailConn) Read(p []byte) (int, error)  { return c.r.Read(p) }
+func (c *deadlineFailConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *deadlineFailConn) Close() error                { return nil }
+func (c *deadlineFailConn) LocalAddr() net.Addr         { return dummyAddr("local") }
+func (c *deadlineFailConn) RemoteAddr() net.Addr        { return dummyAddr("remote") }
+func (c *deadlineFailConn) SetDeadline(time.Time) error { return nil }
+func (c *deadlineFailConn) SetReadDeadline(time.Time) error {
+	c.setCalls++
+	if c.failOnSet != 0 && c.setCalls == c.failOnSet {
+		return errDeadlineFail
+	}
+	return nil
+}
+func (c *deadlineFailConn) SetWriteDeadline(time.Time) error { return nil }
+
 func (c *testConn) ReadFrom(r io.Reader) (int64, error) {
 	c.readFromCalledWith = r
 	b, err := io.ReadAll(r)
@@ -1753,6 +2000,10 @@ func (c *testConn) Read(_ []byte) (int, error) {
 	c.reads--
 	return 1, nil
 }
+
+// SetReadDeadline is a no-op so header processing (which now applies the default
+// read-header timeout) does not dereference the nil embedded net.Conn.
+func (c *testConn) SetReadDeadline(time.Time) error { return nil }
 
 func TestCopyToWrappedConnection(t *testing.T) {
 	innerConn := &testConn{}

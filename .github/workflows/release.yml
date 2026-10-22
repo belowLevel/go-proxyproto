@@ -5,8 +5,17 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: read
+
 jobs:
+  actionlint:
+    uses: ./.github/workflows/actionlint.yml
+
   release:
+    needs: actionlint
+    permissions:
+      contents: write # Required to create releases and generate release notes.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

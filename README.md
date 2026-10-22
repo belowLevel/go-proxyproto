@@ -18,6 +18,8 @@ UDP uses packet helpers because the spec requires a header in every datagram.
 
 ## Installation
 
+Requires Go 1.26.9 or later. CI tests Go 1.26 and 1.27.
+
 ```shell
 $ go get github.com/pires/go-proxyproto
 ```
@@ -64,7 +66,10 @@ conn, err := proxyListener.Accept()
 See [`examples/server`](examples/server) for a complete TCP server. For HTTP/1
 and HTTP/2, see [`examples/httpserver`](examples/httpserver), which uses
 [`helper/http2`](helper/http2) so one server can accept proxied HTTP/1 and HTTP/2
-connections.
+connections. Use `helper/http2.NewServerWithConfig(server, config)` with
+`*net/http.HTTP2Config` for new integrations. The existing `NewServer` constructor
+remains available for compatibility with `golang.org/x/net/http2.Server`, and is
+deprecated.
 
 > [!WARNING]
 > The zero-value configuration requires the PROXY header but still honors it

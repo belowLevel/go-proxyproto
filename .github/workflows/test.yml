@@ -6,25 +6,28 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  actionlint:
+    uses: ./.github/workflows/actionlint.yml
+
   test:
+    needs: actionlint
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.26', '1.27']
+        go: ['1.26.x', '1.27.x']
     steps:
+    - uses: actions/checkout@v7
     - uses: actions/setup-go@v6
       with:
         go-version: ${{ matrix.go }}
-    - uses: actions/checkout@v7
-
-    - name: Get dependencies
-      run: |
-        go get golang.org/x/tools/cmd/cover
-        go get github.com/mattn/goveralls
+        check-latest: true
 
     # The example runnables carry no tests and would only drag the coverage
     # metric down, but they must still compile.
@@ -32,7 +35,10 @@ jobs:
       run: go build ./...
 
     - name: Test
-      run: go test -race -shuffle=on -v -covermode=atomic -coverprofile=coverage.out $(go list ./... | grep -v '/examples/')
+      run: |
+        package_list=$(go list ./... | grep -v '/examples/')
+        mapfile -t packages <<< "$package_list"
+        go test -race -shuffle=on -v -covermode=atomic -coverprofile=coverage.out "${packages[@]}"
 
     - name: Send coverage
       uses: shogo82148/actions-goveralls@v1
@@ -48,6 +54,7 @@ jobs:
   # editing this workflow. A discovered crasher fails the job and is uploaded so
   # it can be reproduced locally.
   fuzz:
+    needs: actionlint
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
@@ -57,12 +64,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.26', '1.27']
+        go: ['1.26.x', '1.27.x']
     steps:
+    - uses: actions/checkout@v7
     - uses: actions/setup-go@v6
       with:
         go-version: ${{ matrix.go }}
-    - uses: actions/checkout@v7
+        check-latest: true
 
     - name: Fuzz
       run: |
@@ -110,7 +118,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v7
       with:
-        name: fuzz-crashers
+        name: fuzz-crashers-Go-${{ matrix.go }}
         path: '**/testdata/fuzz/**'
         if-no-files-found: ignore
 
